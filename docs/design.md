@@ -63,7 +63,8 @@ flowchart LR
 ```
 
 That is the `ssh` provider. With the `docker` provider, the slot side runs in the broker itself
-and reaches the containers through the engine's API:
+and reaches the containers through the engine's API (the `incus` provider alike, through the
+Incus API, its slots Incus containers restored from a snapshot):
 
 ```mermaid
 flowchart LR
@@ -118,6 +119,7 @@ holds (left by a crash between registering and keeping).
 | `internal/forgejo`         | the Forgejo API client (admin and owner tokens)                                                           |
 | `internal/provider`        | the slot provider interface and the SSH provider                                                          |
 | `internal/provider/docker` | the docker provider: the Engine API client and a slot's system                                            |
+| `internal/provider/incus`  | the incus provider: the Incus API client and an API `Instance`                                            |
 | `internal/slot`            | the slot side: the forced command, the reset cycle (Incus), and the slot side run in the broker (`Local`) |
 | `internal/web`             | `/metrics`, `/state`, `/healthz`                                                                          |
 
@@ -140,13 +142,15 @@ A finished slot's peak and task id are part of `Status` (the `last` object), so 
 separate query after its job: the broker reads them at the next look, before the slot takes a
 new assignment.
 
-Two providers implement it:
+Three providers implement it:
 
 - `ssh`: every host is reached as one user whose authorized key forces `forgejo-berth slot`,
   and a `forgejo-berth cycle` per container runs on the host. The protocol is below.
 - `docker`: every host is a Docker Engine; see [Docker provider](#docker-provider).
+- `incus`: every host is an Incus server reached through its API; see
+  [Incus provider](#incus-provider).
 
-The `docker` provider needs nothing on the host. Its slot side runs in the
+The `docker` and `incus` providers need nothing on the host. Their slot side runs in the
 broker's process (`slot.Local`): the same reset cycle per slot, and the same `status`, `assign`
 and `release` as the SSH slot command, on the same state files, kept in the broker's
 `state_dir`, one directory per host. Only the cycle's `System`, the container as the cycle
@@ -319,6 +323,39 @@ runner's log shows its task (its CPU use is then not known).
   rootful engine the host. Their containers are the engine's, not the slot's: their memory is
   not part of the job's peak, and nothing removes what a job leaves. An explicit opt-in, for
   trusted jobs only.
+
+## Incus provider
+
+The reset cycle's Incus logic (the boot wait and its diagnosis, the cache volume, the
+runner's files, the journal's task line) drives an `Instance`, the container as that logic
+reads and changes it. Two implement it:
+
+| Operation    | `incus` command, on the host (SSH)               | Incus API, from the broker (`incus`)                       |
+| ------------ | ------------------------------------------------ | ---------------------------------------------------------- |
+| state        | `incus query /1.0/instances/<c>/state`           | `GET /1.0/instances/<c>/state`                             |
+| stop, start  | `incus stop --force`, `incus start`              | `PUT …/state` (`action`, `force`), an operation waited for |
+| restore      | `incus snapshot restore`                         | `PUT /1.0/instances/<c>` with `restore`                    |
+| exec         | `incus exec <c> --`                              | `POST …/exec`, `record-output`; the records read, removed  |
+| write a file | `sh -c 'cat > tmp…'` from standard input         | `POST …/files` (root, 0600), then `chgrp`, `chmod`, `mv`   |
+| cache device | `incus config device remove/add`                 | `GET` the instance, `PUT` it back with `If-Match`          |
+| its log      | `incus info --show-log`                          | `GET …/logs/lxc.log`                                       |
+| the runner   | its cgroup and `/proc/<pid>/root`, from the host | one `exec` of a script reading the same from inside        |
+| peak         | the cgroup's `memory.peak`, `memory.swap.peak`   | the state's `memory.usage_peak`, `swap_usage_peak`         |
+| CPU          | the cgroup's `cpu.stat`, `cpu.pressure`          | the same files, read by `exec` from inside                 |
+
+Inside a container, cgroup v2 with its cgroup namespace shows the container's own cgroup at
+`/sys/fs/cgroup`, the tree the host sees under `lxc.payload.<c>`. The runner is looked at once
+for both questions of a look (active, busy). An answer that does not come (the API away for a
+moment) counts as active, not busy: the next look asks again, rather than ending a job that
+runs. Where the state reports no peak (a kernel or server without `memory.peak`), the
+container's own `memory.peak` is read from inside.
+
+A host's `address` is `https://host:port`, with the broker's client certificate and the
+server's certificate pinned (`tls.ca_file`: a certificate that is no CA must be the server's
+exactly; a CA checks the chain and the name), or `unix:///path`, the local socket. The
+broker's status of a host is a `GET /1.0` that must say `auth: trusted`. The client uses
+`net/http` only; the response shapes are those of the Incus REST API (sync, async with an
+operation waited for at `/1.0/operations/<id>/wait`, error).
 
 ## Configuration
 
@@ -561,6 +598,9 @@ runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
   and the next run packed by it.
 - The slot command and the cycle are tested on a temporary directory with a fake system; the
   slot side run in the broker and the cycle's resume too.
+- The incus provider is tested against a fake Incus API (HTTPS with client certificates,
+  built from the REST API's documented shapes): a slot's whole life, failed operations, the
+  pinned server certificate. It is not tested against a real Incus server yet.
 - The docker provider is tested against a fake Engine API on a unix socket, and end to end by
   `scripts/real-forgejo.sh docker`: a real Forgejo, the provider on the engine the test runs
   on, real jobs in each slot's own Docker, learned and packed by their peaks.

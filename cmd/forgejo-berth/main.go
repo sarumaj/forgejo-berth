@@ -33,6 +33,7 @@ import (
 	"git.ciepiela.org/dawid/forgejo-berth/internal/history"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/provider/docker"
+	"git.ciepiela.org/dawid/forgejo-berth/internal/provider/incus"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/web"
 )
@@ -144,6 +145,9 @@ func checkFiles(cfg *config.Config) error {
 	case config.ProviderDocker:
 		files = []string{p.Docker.TLS.CAFile, p.Docker.TLS.CertFile, p.Docker.ConfigTemplate}
 		secrets = []string{p.Docker.TLS.KeyFile}
+	case config.ProviderIncus:
+		files = []string{p.Incus.TLS.CAFile, p.Incus.TLS.CertFile, p.Incus.ConfigTemplate}
+		secrets = []string{p.Incus.TLS.KeyFile}
 	}
 	for _, f := range secrets {
 		if f != "" {
@@ -239,12 +243,18 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 }
 
-// newProvider makes the configuration's provider, and what stops it: the docker provider
-// runs the slots' cycles in this process.
+// newProvider makes the configuration's provider, and what stops it: the docker and incus
+// providers run the slots' cycles in this process.
 func newProvider(cfg *config.Config, log *slog.Logger) (provider.Provider, func(), error) {
 	switch cfg.Provider.Type {
 	case config.ProviderDocker:
 		hosted, err := docker.New(cfg, log)
+		if err != nil {
+			return nil, nil, err
+		}
+		return hosted, hosted.Stop, nil
+	case config.ProviderIncus:
+		hosted, err := incus.New(cfg, log)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -10,8 +10,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -20,11 +18,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
 	"git.ciepiela.org/dawid/forgejo-berth/internal/config"
+	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
 )
 
 // maxBody is the most read of an answer that is not a stream: an inspect is a few KiB.
@@ -59,7 +57,7 @@ func NewEngine(address string, t config.TLS) (*Engine, error) {
 		}
 		e.base = "http://docker"
 	case "tcp":
-		tc, err := TLSConfig(t)
+		tc, err := provider.TLSConfig(t)
 		if err != nil {
 			return nil, err
 		}
@@ -69,31 +67,6 @@ func NewEngine(address string, t config.TLS) (*Engine, error) {
 		return nil, fmt.Errorf("%s: unix:///path or tcp://host:port", address)
 	}
 	return e, nil
-}
-
-// TLSConfig is a client's TLS: the server's CA (or its own certificate) from ca_file, else
-// the system's roots, and the client certificate and key. The key is a secret file.
-func TLSConfig(t config.TLS) (*tls.Config, error) {
-	tc := &tls.Config{MinVersion: tls.VersionTLS12}
-	if t.CAFile != "" {
-		pem, err := os.ReadFile(t.CAFile)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("%s: no certificate", t.CAFile)
-		}
-		tc.RootCAs = pool
-	}
-	if t.CertFile != "" {
-		cert, err := tls.LoadX509KeyPair(t.CertFile, config.Secret(t.KeyFile))
-		if err != nil {
-			return nil, fmt.Errorf("the client certificate: %w", err)
-		}
-		tc.Certificates = []tls.Certificate{cert}
-	}
-	return tc, nil
 }
 
 // request sends a request; body is JSON unless it is an io.Reader (then sent as a tar).

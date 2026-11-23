@@ -88,8 +88,8 @@ type Host struct {
 	CPUCores float64 `yaml:"cpu_cores"`
 	// MaxJobs caps the jobs running on it at once (0: no cap).
 	MaxJobs int `yaml:"max_jobs"`
-	// Slots names the host's slots for the docker provider, whose hosts run no slot side of
-	// their own (an SSH host lists its slots itself).
+	// Slots names the host's slots for the docker and incus providers, whose hosts run no
+	// slot side of their own (an SSH host lists its slots itself).
 	Slots []string `yaml:"slots"`
 }
 
@@ -107,12 +107,14 @@ type Provider struct {
 	Type   string `yaml:"type"`
 	SSH    SSH    `yaml:"ssh"`
 	Docker Docker `yaml:"docker"`
+	Incus  Incus  `yaml:"incus"`
 }
 
 // The provider types.
 const (
 	ProviderSSH    = "ssh"
 	ProviderDocker = "docker"
+	ProviderIncus  = "incus"
 )
 
 // SSH is the SSH provider: every host is reached as User with KeyFile, whose
@@ -138,8 +140,8 @@ type TLS struct {
 // Set tells whether any of it is configured.
 func (t TLS) Set() bool { return t.CAFile != "" || t.CertFile != "" || t.KeyFile != "" }
 
-// Slots are the settings of the slots whose reset cycles run in the broker (the docker
-// provider), the same for every slot of every host.
+// Slots are the settings of the slots whose reset cycles run in the broker (the docker and
+// incus providers), the same for every slot of every host.
 type Slots struct {
 	// StateDir keeps each slot's state, per host (default: slots/ beside the history).
 	StateDir string `yaml:"state_dir"`
@@ -188,6 +190,23 @@ type Docker struct {
 	User string `yaml:"user"`
 	// Network is a network the runner and its engine join (default: the engine's default).
 	Network string `yaml:"network"`
+}
+
+// Incus is the incus provider: each host is an Incus server reached through its API, each
+// slot one of its containers, restored from a snapshot before every job.
+type Incus struct {
+	Slots `yaml:",inline"`
+	TLS   TLS `yaml:"tls"`
+	// Project is the Incus project of the slots' containers.
+	Project string `yaml:"project"`
+	// Snapshot is the clean state each container is restored to.
+	Snapshot      string `yaml:"snapshot"`
+	ConfigPath    string `yaml:"config_path"`
+	TokenPath     string `yaml:"token_path"`
+	RunnerService string `yaml:"runner_service"`
+	RunnerUser    string `yaml:"runner_user"`
+	WorkDir       string `yaml:"work_dir"`
+	CachePool     string `yaml:"cache_pool"`
 }
 
 // Estimate holds the rules that turn a job's history into a reservation.
@@ -281,12 +300,22 @@ func (c *Config) defaults() {
 		c.Provider.Type = ProviderSSH
 	}
 	c.slotDefaults(&c.Provider.Docker.Slots)
+	c.slotDefaults(&c.Provider.Incus.Slots)
 	d := &c.Provider.Docker
 	setString(&d.Image, "data.forgejo.org/forgejo/runner:13")
 	setString(&d.ForgejoURL, c.Forgejo.URL)
 	setString(&d.JobEngine, EngineDinD)
 	setString(&d.DinDImage, "docker.io/library/docker:29-dind")
 	setString(&d.HostSocket, "/var/run/docker.sock")
+	i := &c.Provider.Incus
+	setString(&i.Project, "default")
+	setString(&i.Snapshot, "clean")
+	setString(&i.ConfigPath, "/etc/forgejo-runner/config.yml")
+	setString(&i.TokenPath, "/etc/forgejo-runner/token")
+	setString(&i.RunnerService, "forgejo-runner")
+	setString(&i.RunnerUser, "runner")
+	setString(&i.WorkDir, "/var/lib/forgejo-runner/work")
+	setString(&i.CachePool, "default")
 	if c.Provider.SSH.User == "" {
 		c.Provider.SSH.User = "berth"
 	}
@@ -314,6 +343,7 @@ func (c *Config) defaults() {
 		c.History.Path = "/var/lib/forgejo-berth/history.sqlite"
 	}
 	setString(&c.Provider.Docker.StateDir, filepath.Join(filepath.Dir(c.History.Path), "slots"))
+	setString(&c.Provider.Incus.StateDir, filepath.Join(filepath.Dir(c.History.Path), "slots"))
 	if c.Log.Format == "" {
 		c.Log.Format = "text"
 	}
@@ -428,8 +458,22 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 		if !filepath.IsAbs(p.Docker.HostSocket) {
 			fail("provider.docker.host_socket must be an absolute path")
 		}
+	case ProviderIncus:
+		slots = p.Incus.Slots
+		if slots.ConfigTemplate == "" {
+			fail("provider.incus.config_template is required")
+		}
+		for name, v := range map[string]string{"config_path": p.Incus.ConfigPath, "token_path": p.Incus.TokenPath,
+			"work_dir": p.Incus.WorkDir} {
+			if !filepath.IsAbs(v) {
+				fail("provider.incus.%s must be an absolute path", name)
+			}
+		}
+		if strings.ContainsAny(p.Incus.Project, "/?&#% ") {
+			fail("provider.incus.project %q is not a project name", p.Incus.Project)
+		}
 	default:
-		fail("provider.type %q: ssh or docker", p.Type)
+		fail("provider.type %q: ssh, docker or incus", p.Type)
 		return
 	}
 	where := "provider." + p.Type
@@ -456,6 +500,9 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 		fail("%s: idle_hours, job_hours, boot_timeout and timeout_seconds cannot be negative", where)
 	}
 	secure := p.Docker.TLS
+	if p.Type == ProviderIncus {
+		secure = p.Incus.TLS
+	}
 	if secure.Set() && (secure.CertFile == "" || secure.KeyFile == "") {
 		fail("%s.tls: cert_file and key_file go together", where)
 	}
@@ -484,8 +531,13 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 			if !secure.Set() {
 				fail("hosts[%d].address %q: a tcp:// engine needs provider.docker.tls", i, h.Address)
 			}
+		case p.Type == ProviderIncus && u.Scheme == "https" && u.Host != "":
+			if secure.CertFile == "" {
+				fail("hosts[%d].address %q: an https:// server needs provider.incus.tls", i, h.Address)
+			}
 		default:
-			fail("hosts[%d].address %q: unix:///path or tcp://host:port", i, h.Address)
+			fail("hosts[%d].address %q: unix:///path or %s", i, h.Address,
+				map[string]string{ProviderDocker: "tcp://host:port", ProviderIncus: "https://host:port"}[p.Type])
 		}
 	}
 }

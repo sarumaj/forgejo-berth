@@ -130,6 +130,8 @@ provider:
 			"job_engine"},
 		{"a typo", `{type: docker, docker: {imag: x, labels: {shared: {docker: d}}}}`, "imag"},
 		{"a remote engine without TLS", `{type: docker, docker: {labels: {shared: {docker: d}}}}`, "needs"},
+		{"an incus provider without a template", `{type: incus, incus: {labels: {shared: {docker: d}}}}`,
+			"config_template"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			text := dockerHosts
@@ -153,7 +155,7 @@ provider:
 }
 
 func TestTheProviderExamplesAreValid(t *testing.T) {
-	for _, name := range []string{"config-docker.yml"} {
+	for _, name := range []string{"config-docker.yml", "config-incus.yml"} {
 		data, err := os.ReadFile("../../examples/" + name)
 		if err != nil {
 			t.Fatal(err)
