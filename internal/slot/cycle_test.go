@@ -3,6 +3,7 @@
 package slot
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -430,5 +431,77 @@ func TestCPUCounters(t *testing.T) {
 	write(t, filepath.Join(dir, "cpu.pressure"), "some avg10=1.00 avg60=0.50 avg300=0.10 total=250000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1000\n")
 	if _, p, _ := CPUCounters(dir); p != 250000 {
 		t.Fatalf("pressure %d", p)
+	}
+}
+
+// scripted is an incus stand-in: each command's answer by its first words.
+func scripted(answers map[string]string, calls *[]string) func(context.Context, []byte, ...string) ([]byte, []byte, error) {
+	return func(_ context.Context, _ []byte, args ...string) ([]byte, []byte, error) {
+		line := strings.Join(args, " ")
+		*calls = append(*calls, line)
+		for prefix, answer := range answers {
+			if strings.HasPrefix(line, prefix) {
+				if strings.HasPrefix(answer, "ERR:") {
+					return nil, []byte(strings.TrimPrefix(answer, "ERR:")), errors.New("exit status 1")
+				}
+				return []byte(answer), nil, nil
+			}
+		}
+		return nil, nil, nil
+	}
+}
+
+func TestAFailedBootSaysWhy(t *testing.T) {
+	s := &Settings{Container: "ci", BootTimeout: 1}
+	s.defaults()
+	s.BootTimeout = 1
+	var calls []string
+	i := NewIncus(s)
+	i.run = scripted(map[string]string{
+		"query /1.0/instances/ci/state": `{"status": "Running"}`,
+		"exec ci -- timeout":            "maintenance\n",
+		"exec ci -- systemctl --failed": "docker.service loaded failed failed Docker\nx.mount loaded failed failed X\n",
+		"info ci --show-log":            "Name: ci\nLog:\n\nlxc ci: oops\nlast line\n",
+	}, &calls)
+	err := i.Reset()
+	if err == nil {
+		t.Fatal("the boot did not fail")
+	}
+	for _, want := range []string{`"maintenance"`, "failed units: docker.service, x.mount", "its log ends:\n  lxc ci: oops\n  last line"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error lacks %q: %v", want, err)
+		}
+	}
+	if !slices.Contains(calls, "snapshot restore ci clean") {
+		t.Fatalf("calls %v", calls)
+	}
+}
+
+func TestApplyWritesTheConfigurationAndToken(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yml"), "uuid: @@RUNNER_UUID@@\nlabels: @@RUNNER_LABELS@@\n")
+	s := &Settings{Container: "ci", ConfigTemplate: filepath.Join(dir, "config.yml"),
+		CacheVolumes: map[string]string{"shared": "cache-shared"}}
+	s.defaults()
+	var calls []string
+	var stdins []string
+	i := NewIncus(s)
+	i.run = func(_ context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
+		calls = append(calls, strings.Join(args, " "))
+		stdins = append(stdins, string(stdin))
+		return nil, nil, nil
+	}
+	err := i.Apply(provider.Parsed{ID: "a-1", UUID: testUUID, Token: testToken, Class: "shared",
+		Labels: []string{"docker:docker://node:24-trixie"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "config device add ci cache disk pool=default source=cache-shared path=/var/cache/forgejo-runner") {
+		t.Fatalf("calls:\n%s", joined)
+	}
+	if !slices.Contains(stdins, "uuid: "+testUUID+"\nlabels: [\"docker:docker://node:24-trixie\"]\n") ||
+		!slices.Contains(stdins, testToken) || strings.Contains(joined, testToken) {
+		t.Fatalf("stdins %q", stdins)
 	}
 }

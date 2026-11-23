@@ -116,14 +116,14 @@ func (i *Incus) Reset() error {
 		return err
 	}
 	deadline := time.Now().Add(time.Duration(i.settings.BootTimeout * float64(time.Second)))
-	state := ""
+	state, lastErr := "", ""
 	for {
 		left := max(1, int(time.Until(deadline).Seconds()))
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(left+30)*time.Second)
-		out, _, _ := i.run(ctx, nil, "exec", name, "--", "timeout", strconv.Itoa(left), "systemctl",
+		out, errOut, _ := i.run(ctx, nil, "exec", name, "--", "timeout", strconv.Itoa(left), "systemctl",
 			"is-system-running", "--wait")
 		cancel()
-		state = strings.TrimSpace(string(out))
+		state, lastErr = strings.TrimSpace(string(out)), strings.TrimSpace(string(errOut))
 		// Right after the start, systemd in the container does not answer yet: --wait then
 		// returns at once, offline or without its bus, instead of waiting. Asked again until
 		// the boot timeout, while the container runs.
@@ -134,9 +134,70 @@ func (i *Incus) Reset() error {
 		time.Sleep(2 * time.Second)
 	}
 	if state != "running" && state != "degraded" {
-		return fmt.Errorf("the container did not boot: %q", state)
+		return fmt.Errorf("the container did not boot: %q%s", state, i.bootDiagnosis(lastErr))
 	}
 	return nil
+}
+
+// bootLogLines is how much of the container's own log a failed boot reports.
+const bootLogLines = 20
+
+// bootDiagnosis says why a boot failed, for the journal (the next reset loses it): what
+// Incus said, the units that failed while the container still runs, and the end of its own
+// log (its console and LXC's). A part that cannot be read is left out.
+func (i *Incus) bootDiagnosis(incusErr string) string {
+	var parts []string
+	if incusErr != "" {
+		parts = append(parts, "incus: "+incusErr)
+	}
+	if up, err := i.running(); err == nil && up {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		out, _, _ := i.run(ctx, nil, "exec", i.settings.Container, "--", "systemctl", "--failed", "--no-legend", "--plain")
+		cancel()
+		var units []string
+		for _, line := range strings.Split(string(out), "\n") {
+			if fields := strings.Fields(line); len(fields) > 0 {
+				units = append(units, fields[0])
+			}
+		}
+		parts = append(parts, "failed units: "+orNone(strings.Join(units, ", ")))
+	} else if err == nil {
+		parts = append(parts, "the container is not running")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	out, _, err := i.run(ctx, nil, "info", i.settings.Container, "--show-log")
+	cancel()
+	if err == nil {
+		var log []string
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.TrimSpace(line) != "" {
+				log = append(log, line)
+			}
+		}
+		for n, line := range log {
+			if line == "Log:" {
+				log = log[n+1:]
+				break
+			}
+		}
+		if len(log) > bootLogLines {
+			log = log[len(log)-bootLogLines:]
+		}
+		if len(log) > 0 {
+			parts = append(parts, "its log ends:\n  "+strings.Join(log, "\n  "))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(parts, "; ")
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 // Apply attaches the class's cache volume (in place of any the snapshot had) and writes the
