@@ -77,6 +77,9 @@ type Cycle struct {
 	cpuAtJob [2]int64
 	cpuOK    bool
 	resume   bool
+	// held is set while the cycle holds the slot paused, the container reset: a cycle that
+	// starts while the slot is still paused leaves the container as it is.
+	held bool
 }
 
 // CycleOptions are the cycle's collaborators; nil ones are the real ones.
@@ -116,10 +119,16 @@ func (c *Cycle) interval() time.Duration {
 	return time.Duration(c.settings.Interval * float64(time.Second))
 }
 
-// Run resets, serves one assignment, and starts over, until stopping.
+// Run resets, serves one assignment, and starts over, until stopping. A paused slot is
+// reset and then held until it is resumed; a slot the last cycle held paused, and still
+// paused, is held at once, its container not reset.
 func (c *Cycle) Run() {
+	held := c.saved().Held
 	if c.resume && !c.Resume() {
 		c.backOff()
+	}
+	if paused, _ := c.pauseRequest(); held && paused {
+		c.holdPaused()
 	}
 	for !c.stopping() {
 		if !c.Reset() {
@@ -128,6 +137,10 @@ func (c *Cycle) Run() {
 		}
 		if c.stopping() {
 			break
+		}
+		if paused, _ := c.pauseRequest(); paused {
+			c.holdPaused()
+			continue
 		}
 		a, ok := c.WaitAssignment()
 		if !ok {
@@ -163,8 +176,37 @@ func (c *Cycle) Reset() bool {
 	return true
 }
 
+// pauseRequest tells whether the slot is paused, and whether its job is to be stopped for
+// that rather than run to its end.
+func (c *Cycle) pauseRequest() (paused, stop bool) {
+	data, err := os.ReadFile(c.settings.path(".pause"))
+	if err != nil {
+		return false, false
+	}
+	return true, strings.TrimSpace(string(data)) == PauseStop
+}
+
+// holdPaused holds the reset slot paused: it takes no assignment, and its container is left
+// as it is, until the slot is resumed or the cycle stops.
+func (c *Cycle) holdPaused() {
+	c.held = true
+	c.setState(provider.Paused)
+	c.log.Info("paused: takes no assignment until it is resumed")
+	for !c.stopping() {
+		if paused, _ := c.pauseRequest(); !paused {
+			c.held = false
+			c.write()
+			c.log.Info("resumed")
+			return
+		}
+		c.sleep(c.interval())
+	}
+}
+
 // WaitAssignment is the ready slot: it returns the next assignment, or false when stopping
-// or after idle_hours (the container is refreshed). One out of shape is dropped.
+// or after idle_hours (the container is refreshed), or after a pause (held until it is
+// resumed: the container is then reset). One out of shape is dropped. An assignment taken
+// before a pause is served.
 func (c *Cycle) WaitAssignment() (provider.Parsed, bool) {
 	path := c.settings.path(".assignment")
 	// A release that came too late for the last assignment is of no use to the next.
@@ -184,6 +226,10 @@ func (c *Cycle) WaitAssignment() (provider.Parsed, bool) {
 			}
 			c.log.Warn("the assignment was dropped", "error", err)
 			_ = os.Remove(path)
+		}
+		if paused, _ := c.pauseRequest(); paused {
+			c.holdPaused()
+			return provider.Parsed{}, false
 		}
 		if c.now().Sub(since).Hours() > c.settings.IdleHours {
 			c.log.Info("ready too long, refreshed", "hours", c.settings.IdleHours)
@@ -231,6 +277,8 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 	c.assignment, c.servedSince, c.jobSince, c.unusedMinutes = a.ID, started, jobSince, a.UnusedMinutes
 	c.write()
 	lastLook := started
+	// pausedOut: the runner was stopped for a pause, not failed.
+	pausedOut := false
 	for {
 		c.sleep(c.interval())
 		if c.stopping() {
@@ -254,6 +302,8 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 			why := ""
 			if c.released(a) {
 				why = "released by the broker"
+			} else if paused, _ := c.pauseRequest(); paused {
+				why, pausedOut = "the slot is paused", true
 			} else if idle := now.Sub(started); idle.Minutes() > a.UnusedMinutes {
 				why = fmt.Sprintf("unused for %g minutes", a.UnusedMinutes)
 			}
@@ -269,6 +319,9 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 		} else if now.Sub(jobSince).Hours() > c.settings.JobHours {
 			c.log.Warn("its job ran too long; reset", "hours", c.settings.JobHours)
 			break
+		} else if paused, stop := c.pauseRequest(); paused && stop {
+			c.log.Warn("its job is stopped: the slot is paused at once; reset")
+			break
 		}
 	}
 	c.system.SaveJournal()
@@ -279,7 +332,7 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 		c.write()
 		return true
 	}
-	if c.now().Sub(started).Seconds() < quickExit {
+	if c.now().Sub(started).Seconds() < quickExit && !pausedOut {
 		c.failures++
 		c.log.Error("the runner exited without a job", "in_a_row", c.failures)
 		c.setState(provider.Failed)
@@ -308,6 +361,16 @@ type savedState struct {
 	UnusedMinutes float64            `json:"unused_minutes"`
 	CPUAtJob      [2]int64           `json:"cpu_at_job"`
 	CPUOK         bool               `json:"cpu_ok"`
+	Held          bool               `json:"held"`
+}
+
+// saved reads what the slot's last cycle left in its state file (nothing: zero).
+func (c *Cycle) saved() savedState {
+	var old savedState
+	if data, err := os.ReadFile(c.settings.path(".json")); err == nil {
+		_ = json.Unmarshal(data, &old)
+	}
+	return old
 }
 
 // Resume reads what the slot's last cycle left in its state file: the last finished
@@ -426,6 +489,7 @@ func (c *Cycle) write() {
 		"unused_minutes":     c.unusedMinutes,
 		"cpu_at_job":         c.cpuAtJob,
 		"cpu_ok":             c.cpuOK,
+		"held":               c.held,
 	}
 	data, _ := json.MarshalIndent(state, "", "  ")
 	if err := replace(s.path(".json"), append(data, '\n')); err != nil {

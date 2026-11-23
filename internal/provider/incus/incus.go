@@ -24,20 +24,13 @@ func Settings(c config.Incus, host, container string) *slot.Settings {
 	return s
 }
 
-// New makes the provider of the configuration's hosts. Its cycles run once made (never in
-// shadow mode, which only reads the slots' state); Stop ends them and leaves the containers
-// to the next start.
-func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
-	c := cfg.Provider.Incus
-	timeout := time.Duration(c.TimeoutSeconds * float64(time.Second))
+// Slots are the hosts' slot sides, their cycles not started: what pausing and resuming a
+// slot changes (their state directories).
+func Slots(cfg *config.Config) (slot.Hosted, error) {
 	hosted := slot.Hosted{}
 	for _, h := range cfg.Hosts {
-		client, err := NewClient(h.Address, cfg.HostTLS(h), c.Project)
-		if err != nil {
-			return nil, err
-		}
 		// The host's own configuration template and label tables, where it has them.
-		hc := c
+		hc := cfg.Provider.Incus
 		hc.Slots = cfg.HostSlots(h)
 		slots := map[string]*slot.Settings{}
 		for _, name := range h.Slots {
@@ -47,6 +40,27 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 		if err != nil {
 			return nil, err
 		}
+		hosted[h.Name] = local
+	}
+	return hosted, nil
+}
+
+// New makes the provider of the configuration's hosts. Its cycles run once made (never in
+// shadow mode, which only reads the slots' state); Stop ends them and leaves the containers
+// to the next start.
+func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
+	c := cfg.Provider.Incus
+	timeout := time.Duration(c.TimeoutSeconds * float64(time.Second))
+	hosted, err := Slots(cfg)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range cfg.Hosts {
+		client, err := NewClient(h.Address, cfg.HostTLS(h), c.Project)
+		if err != nil {
+			return nil, err
+		}
+		local := hosted[h.Name]
 		local.Ping = func(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()

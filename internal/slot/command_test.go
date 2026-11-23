@@ -160,3 +160,41 @@ func TestRelease(t *testing.T) {
 		t.Fatalf("release file %q", data)
 	}
 }
+
+func TestPauseAndResume(t *testing.T) {
+	dir := hostDir(t)
+	if code, out := command(dir, "pause ci", ""); code != 0 || out != "ready\n" {
+		t.Fatalf("pause = %d %q", code, out)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "run/ci.pause")); string(data) != "finish\n" {
+		t.Fatalf("pause file %q", data)
+	}
+	code, out := command(dir, "status", "")
+	if code != 0 || !strings.Contains(out, `"paused":true`) {
+		t.Fatalf("status = %d %s", code, out)
+	}
+	// A paused slot takes nothing, even while its cycle still reports it ready.
+	if code, out := command(dir, "assign ci", assignment(nil)); code != 1 || !strings.Contains(out, "is paused") {
+		t.Fatalf("assign to a paused slot = %d %s", code, out)
+	}
+	if code, _ := command(dir, "pause ci stop", ""); code != 0 {
+		t.Fatal("pause stop failed")
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "run/ci.pause")); string(data) != "stop\n" {
+		t.Fatalf("pause file %q", data)
+	}
+	for _, request := range []string{"pause ci now", "pause other", "pause", "resume ci x"} {
+		if code, _ := command(dir, request, ""); code != 1 {
+			t.Errorf("%q was taken", request)
+		}
+	}
+	if code, out := command(dir, "resume ci", ""); code != 0 || out != "ready\n" || exists(filepath.Join(dir, "run/ci.pause")) {
+		t.Fatalf("resume = %d %q", code, out)
+	}
+	if code, _ := command(dir, "resume ci", ""); code != 0 {
+		t.Fatal("resuming a slot not paused failed")
+	}
+	if code, out := command(dir, "assign ci", assignment(nil)); code != 0 {
+		t.Fatalf("assign after the resume = %d %s", code, out)
+	}
+}

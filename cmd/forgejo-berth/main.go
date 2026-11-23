@@ -7,6 +7,8 @@
 //	forgejo-berth check [--config FILE]                 checks the configuration and the secrets
 //	forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]  the slot's forced SSH command
 //	forgejo-berth cycle [--settings-dir DIR] CONTAINER  one slot's reset cycle
+//	forgejo-berth pause [--config FILE] [--stop] HOST/SLOT  holds a slot out of service
+//	forgejo-berth resume [--config FILE] HOST/SLOT      puts it back
 //	forgejo-berth version
 package main
 
@@ -23,6 +25,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,6 +52,8 @@ const (
        forgejo-berth check [--config FILE]
        forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]
        forgejo-berth cycle [--settings-dir DIR] [--log-format text|json] CONTAINER
+       forgejo-berth pause [--config FILE] [--stop] HOST/SLOT
+       forgejo-berth resume [--config FILE] HOST/SLOT
        forgejo-berth version`
 )
 
@@ -72,6 +78,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runSlot(args[1:], stdin, stdout, stderr)
 	case "cycle":
 		return runCycle(args[1:], stdout, stderr)
+	case "pause", "resume":
+		return runPause(args[0], args[1:], stdout, stderr)
 	}
 	fmt.Fprintln(stderr, usage)
 	return 2
@@ -306,6 +314,75 @@ func runSlot(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return slot.Command(request, *dir, stdin, stdout, stderr)
+}
+
+// runPause pauses or resumes a slot of the configuration: through the slot command for an
+// SSH host, in the broker's state directory for the docker and incus providers (whose running
+// broker's cycles see it there).
+func runPause(name string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("config", defaultConfig, "the configuration file")
+	var stop bool
+	if name == "pause" {
+		fs.BoolVar(&stop, "stop", false, "stop the slot's job at once rather than let it end")
+	}
+	if err := fs.Parse(args); err != nil || fs.NArg() != 1 {
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
+	hostName, container, _ := strings.Cut(fs.Arg(0), "/")
+	if !config.Name.MatchString(hostName) || !config.Name.MatchString(container) {
+		fmt.Fprintf(stderr, "%q is not HOST/SLOT\n", fs.Arg(0))
+		return 2
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	err = func() error {
+		host, ok := cfg.Host(hostName)
+		if !ok {
+			return fmt.Errorf("no host %s in the configuration", hostName)
+		}
+		var slots provider.Pauser
+		switch cfg.Provider.Type {
+		case config.ProviderDocker, config.ProviderIncus:
+			if !slices.Contains(host.Slots, container) {
+				return fmt.Errorf("no slot %s on %s", container, hostName)
+			}
+			if cfg.Provider.Type == config.ProviderDocker {
+				slots, err = docker.Slots(cfg)
+			} else {
+				slots, err = incus.Slots(cfg)
+			}
+			if err != nil {
+				return err
+			}
+		default:
+			slots = provider.NewSSH(cfg.Provider.SSH, nil)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		var state string
+		if name == "pause" {
+			state, err = slots.Pause(ctx, host, container, stop)
+		} else {
+			state, err = slots.Resume(ctx, host, container)
+		}
+		if err != nil {
+			return err
+		}
+		done := map[bool]string{true: "paused", false: "resumed"}[name == "pause"]
+		fmt.Fprintf(stdout, "%s/%s: %s; the slot is %s\n", hostName, container, done, state)
+		return nil
+	}()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 func runCycle(args []string, stdout, stderr io.Writer) int {

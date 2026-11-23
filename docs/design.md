@@ -112,7 +112,7 @@ holds (left by a crash between registering and keeping).
 
 | Package                    | Role                                                                                                      |
 | -------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `cmd/forgejo-berth`        | subcommands `run`, `slot`, `cycle`, `check`, `version`                                                    |
+| `cmd/forgejo-berth`        | subcommands `run`, `slot`, `cycle`, `check`, `pause`, `resume`, `version`                                 |
 | `internal/config`          | the broker's YAML configuration, defaults and validation                                                  |
 | `internal/broker`          | jobs, slots, assignments; offer, predict, schedule; the loop                                              |
 | `internal/history`         | SQLite: finished runs and the assignments held across restarts                                            |
@@ -196,6 +196,7 @@ at a live instance's.
 | `resetting` | the container is being restored from its snapshot                     |
 | `failed`    | a reset or a runner start failed; the cycle backs off and tries again |
 | `stopped`   | the cycle is not running                                              |
+| `paused`    | reset and held out of service until it is resumed                     |
 
 A slot is free only when it is `ready` with no assignment and no kept assignment of the broker
 names it.
@@ -210,7 +211,7 @@ restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot --
 ```
 
 `forgejo-berth slot` takes the whole requested command as one argument (or from
-`SSH_ORIGINAL_COMMAND`) and knows three commands. Anything else exits 1 with a usage line. The
+`SSH_ORIGINAL_COMMAND`) and knows five commands. Anything else exits 1 with a usage line. The
 argument follows `--`, which ends the command's own flags: a request beginning with `-` is then
 a request (refused), never a flag such as `--settings-dir`.
 
@@ -250,6 +251,13 @@ with an assignment already waiting, and an assignment out of shape.
 `release <container> <assignment>` asks the cycle to stop the assignment's runner if it still
 has no job. It refuses a slot that does not hold that assignment.
 
+`pause <container>` and `pause <container> stop` pause the slot (see
+[Pausing a slot](#pausing-a-slot)), `resume <container>` resumes it; each prints the slot's
+state. A paused slot's `status` entry has `"paused": true` (omitted otherwise), and `assign`
+refuses it. A broker of an older version reads neither: it sees a slot that is not `ready`.
+The broker's key may pause and resume the host's slots, which takes nothing from it that it
+could not deny by assigning nothing; `forgejo-berth pause` uses that.
+
 The host maps label *names* to runner labels by the class's own table, so a shared runner can
 never get a host label, whatever the broker sends. The broker sends names only.
 
@@ -278,7 +286,33 @@ Failures back off from 30 seconds, doubling to 10 minutes. A SIGTERM ends the lo
 step in progress and leaves the container as it is (`stopped`).
 
 The state goes to `<state_dir>/<container>.json`; the assignment to `<container>.assignment`,
-the release to `<container>.release`.
+the release to `<container>.release`, a pause to `<container>.pause`.
+
+### Pausing a slot
+
+A pause is the file `<container>.pause` beside the slot's state (written by `pause`, 0644, its
+content `finish` or `stop`; removed by `resume`). The cycle reads it at each of its looks:
+
+- **ready**: an assignment written before the pause is still taken and served (the broker
+  holds its runner); otherwise the cycle holds the slot (`paused`) at once, without a reset;
+- **assigned** (a runner without a job): the runner is stopped as for a release, unless its
+  journal shows it took a task; that is no failure of the slot (no back-off);
+- **running**: the job runs to its end; with `stop` it is cut as a job over `job_hours` is,
+  and the reset stops it;
+- **reset**: after every reset the cycle holds a paused slot instead of waiting for an
+  assignment.
+
+Held, the slot is `paused`: its container is as the reset left it (an Incus container
+restored and running; a Docker slot without containers), and the cycle does nothing but look
+for the resume. Resumed, it resets the container (an Incus container is restored from its
+snapshot, which the one who paused it may have made anew) and is `ready`.
+
+The state file notes that the cycle holds the slot (`held`). A cycle that starts while the slot
+is held and still paused (a broker or a cycle restarted) holds it again at once, without the
+reset that a start does otherwise: the container may be in the middle of its change. A slot
+paused while no cycle ran is reset at the start, then held. The pause file lives as long as
+`state_dir`: the broker's (beside the history) is on disk; an SSH host's default
+(`/run/forgejo-berth`) is not kept over the host's reboot.
 
 ### Cache volumes
 

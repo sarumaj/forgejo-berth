@@ -80,6 +80,7 @@ func Status(slots map[string]*Settings) provider.StatusDocument {
 		if p := pending(s); p != "" {
 			entry.State, entry.Assignment = provider.Pending, p
 		}
+		entry.Paused = paused(s)
 		doc.Slots = append(doc.Slots, entry)
 	}
 	return doc
@@ -90,6 +91,9 @@ func Assign(slots map[string]*Settings, container string, data []byte) (string, 
 	s, ok := slots[container]
 	if !ok {
 		return "", refuse("no slot %s", container)
+	}
+	if paused(s) {
+		return "", refuse("%s is paused", container)
 	}
 	if readState(s).State != provider.Ready {
 		return "", refuse("%s is not ready", container)
@@ -120,6 +124,59 @@ func Release(slots map[string]*Settings, container, id string) error {
 	return writePrivate(s.path(".release"), []byte(id))
 }
 
+// How a slot pauses, as its pause file says: once its job ended, or at once.
+const (
+	PauseFinish = "finish"
+	PauseStop   = "stop"
+)
+
+// paused tells whether the slot is paused (or pausing).
+func paused(s *Settings) bool {
+	_, err := os.Stat(s.path(".pause"))
+	return err == nil
+}
+
+// PauseSlot pauses a slot: its cycle takes no assignment once its job ended, or with stop at
+// once, its job stopped. The pause is a file in the state directory: it lasts until
+// ResumeSlot, across restarts of the cycle. It returns the slot's state.
+func PauseSlot(slots map[string]*Settings, container string, stop bool) (string, error) {
+	s, ok := slots[container]
+	if !ok {
+		return "", refuse("no slot %s", container)
+	}
+	mode := PauseFinish
+	if stop {
+		mode = PauseStop
+	}
+	if err := os.MkdirAll(s.StateDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := replace(s.path(".pause"), []byte(mode+"\n")); err != nil {
+		return "", err
+	}
+	return stateOf(s), nil
+}
+
+// ResumeSlot lets a paused slot take assignments again (its cycle resets the container
+// first); it returns the slot's state.
+func ResumeSlot(slots map[string]*Settings, container string) (string, error) {
+	s, ok := slots[container]
+	if !ok {
+		return "", refuse("no slot %s", container)
+	}
+	if err := os.Remove(s.path(".pause")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return stateOf(s), nil
+}
+
+func stateOf(s *Settings) string {
+	if state := readState(s).State; state != "" {
+		return state
+	}
+	return "unknown"
+}
+
 // Command runs the broker's request (its whole SSH command, as one string) against the
 // slots of the settings directory; it returns the exit code.
 func Command(request string, settingsDir string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -147,8 +204,22 @@ func Command(request string, settingsDir string, stdin io.Reader, stdout, stderr
 		case len(words) == 3 && words[0] == "release" && config.Name.MatchString(words[1]) &&
 			provider.AssignmentID.MatchString(words[2]):
 			return Release(slots, words[1], words[2])
+		case (len(words) == 2 || len(words) == 3 && words[2] == PauseStop) && words[0] == "pause" &&
+			config.Name.MatchString(words[1]):
+			state, err := PauseSlot(slots, words[1], len(words) == 3)
+			if err == nil {
+				_, err = fmt.Fprintln(stdout, state)
+			}
+			return err
+		case len(words) == 2 && words[0] == "resume" && config.Name.MatchString(words[1]):
+			state, err := ResumeSlot(slots, words[1])
+			if err == nil {
+				_, err = fmt.Fprintln(stdout, state)
+			}
+			return err
 		}
-		return refuse("usage: status | assign <container> | release <container> <assignment>")
+		return refuse("usage: status | assign <container> | release <container> <assignment> | " +
+			"pause <container> [stop] | resume <container>")
 	}()
 	if err == nil {
 		return 0

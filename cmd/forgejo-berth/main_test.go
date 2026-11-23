@@ -66,3 +66,49 @@ func TestTheSlotRequestFromTheEnvironment(t *testing.T) {
 		t.Fatalf("exit %d: %s%s", code, out.String(), errOut.String())
 	}
 }
+
+// pause and resume of a docker slot change its state directory, where the broker's cycle
+// sees them; a slot that is not configured is refused.
+func TestPauseAndResumeADockerSlot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	text := `forgejo: {url: https://forgejo.example.org, admin_token_file: admin.token}
+shared: {labels: [docker]}
+hosts: [{name: local, address: "unix:///run/docker.sock", memory_mib: 8000, slots: [a, b]}]
+history: {path: ` + filepath.Join(dir, "history.sqlite") + `}
+provider: {type: docker, docker: {labels: {shared: {docker: d}}}}
+`
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pauseFile := filepath.Join(dir, "slots", "local", "b.pause")
+	call := func(args ...string) (int, string) {
+		var out, errOut bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &errOut)
+		return code, out.String() + errOut.String()
+	}
+	if code, out := call("pause", "--config", path, "--stop", "local/b"); code != 0 ||
+		out != "local/b: paused; the slot is unknown\n" {
+		t.Fatalf("pause = %d %q", code, out)
+	}
+	if data, _ := os.ReadFile(pauseFile); string(data) != "stop\n" {
+		t.Fatalf("pause file %q", data)
+	}
+	if code, out := call("resume", "--config", path, "local/b"); code != 0 || !strings.Contains(out, "resumed") {
+		t.Fatalf("resume = %d %q", code, out)
+	}
+	if _, err := os.Stat(pauseFile); err == nil {
+		t.Fatal("still paused")
+	}
+	for _, args := range [][]string{{"pause", "--config", path, "local/c"}, {"pause", "--config", path, "ci-9/a"}} {
+		if code, out := call(args...); code != 1 || !strings.Contains(out, "no ") {
+			t.Errorf("%v = %d %q", args, code, out)
+		}
+	}
+	for _, args := range [][]string{{"pause", "--config", path, "local"}, {"resume", "--stop", "local/b"},
+		{"pause", "--config", path}} {
+		if code, _ := call(args...); code != 2 {
+			t.Errorf("%v was taken", args)
+		}
+	}
+}

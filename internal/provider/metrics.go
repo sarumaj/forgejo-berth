@@ -19,7 +19,7 @@ type CycleStats struct {
 }
 
 // CycleStates are the states the forgejo_berth_cycle_state metric has a series of.
-var CycleStates = []string{Resetting, Ready, Assigned, Running, Failed, Stopped}
+var CycleStates = []string{Resetting, Ready, Assigned, Running, Failed, Stopped, Paused}
 
 // CycleReporter is a provider that runs the slots' cycles itself and reports them.
 type CycleReporter interface {

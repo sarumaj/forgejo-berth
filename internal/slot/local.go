@@ -83,6 +83,16 @@ func (l *Local) Release(container, id string) error {
 	return Release(l.slots, container, id)
 }
 
+// Pause pauses the slot (see PauseSlot).
+func (l *Local) Pause(container string, stop bool) (string, error) {
+	return PauseSlot(l.slots, container, stop)
+}
+
+// Resume resumes the slot (see ResumeSlot).
+func (l *Local) Resume(container string) (string, error) {
+	return ResumeSlot(l.slots, container)
+}
+
 // Cycles reports the host's cycles from their state files, as the cycles on an SSH host
 // write them to their textfiles; none when they do not run here (shadow mode).
 func (l *Local) Cycles(host string) []provider.CycleStats {
@@ -134,6 +144,24 @@ func (h Hosted) Release(_ context.Context, host config.Host, container, assignme
 		return fmt.Errorf("%s: no such host", host.Name)
 	}
 	return l.Release(container, assignment)
+}
+
+// Pause pauses a slot of the host.
+func (h Hosted) Pause(_ context.Context, host config.Host, container string, stop bool) (string, error) {
+	l, ok := h[host.Name]
+	if !ok {
+		return "", fmt.Errorf("%s: no such host", host.Name)
+	}
+	return l.Pause(container, stop)
+}
+
+// Resume resumes a slot of the host.
+func (h Hosted) Resume(_ context.Context, host config.Host, container string) (string, error) {
+	l, ok := h[host.Name]
+	if !ok {
+		return "", fmt.Errorf("%s: no such host", host.Name)
+	}
+	return l.Resume(container)
 }
 
 // Cycles reports every host's cycles, by host and container.

@@ -323,16 +323,19 @@ volume behind, for `docker volume rm` or `incus storage volume delete`.
 
 ## Slot protocol
 
-The broker runs one of three commands over SSH; the host's key forces `forgejo-berth slot`,
-which takes the requested command as its one argument (or from `SSH_ORIGINAL_COMMAND`). Put
-`--` before the argument, as above: a request after `--` is never taken for a flag, whatever it
-begins with (without it, one beginning with `-` would be parsed as the command's flags).
+The broker runs these commands over SSH (`pause` and `resume` for `forgejo-berth pause`); the
+host's key forces `forgejo-berth slot`, which takes the requested command as its one argument
+(or from `SSH_ORIGINAL_COMMAND`). Put `--` before the argument, as above: a request after `--`
+is never taken for a flag, whatever it begins with (without it, one beginning with `-` would be
+parsed as the command's flags).
 
-| Command                            | Input           | Output                                      |
-| ---------------------------------- | --------------- | ------------------------------------------- |
-| `status`                           | none            | JSON: the slots and their last finished job |
-| `assign <container>`               | assignment JSON | the assignment id; exit 1 when refused      |
-| `release <container> <assignment>` | none            | exit 1 when the slot does not hold it       |
+| Command                            | Input           | Output                                               |
+| ---------------------------------- | --------------- | ---------------------------------------------------- |
+| `status`                           | none            | JSON: the slots and their last finished job          |
+| `assign <container>`               | assignment JSON | the assignment id; exit 1 when refused               |
+| `release <container> <assignment>` | none            | exit 1 when the slot does not hold it                |
+| `pause <container> [stop]`         | none            | the slot's state ([Pausing a slot](#pausing-a-slot)) |
+| `resume <container>`               | none            | the slot's state                                     |
 
 ```json
 {"slots": [{"container": "ci-a", "state": "ready", "state_since": 1763700000,
@@ -347,10 +350,37 @@ begins with (without it, one beginning with `-` would be parsed as the command's
 ```
 
 States: `ready`, `pending` (written, not taken yet), `assigned`, `running`, `resetting`,
-`failed`, `stopped`. The class (`trusted` for owners' runners, `shared` for global ones)
-selects the slot's own label table: the slot maps label names to runner labels, so a shared
-runner never gets a trusted label, whatever it is sent. Every field's check is in
+`failed`, `stopped`, `paused`; `"paused": true` while a slot is paused or pausing. The class
+(`trusted` for owners' runners, `shared` for global ones) selects the slot's own label table:
+the slot maps label names to runner labels, so a shared runner never gets a trusted label,
+whatever it is sent. Every field's check is in
 [docs/design.md](docs/design.md#slot-protocol-ssh).
+
+## Pausing a slot
+
+A slot can be taken out of service without stopping the broker, for instance while its
+container is reconfigured:
+
+```sh
+forgejo-berth pause --config /etc/forgejo-berth/config.yml ci-1/ci-a          # after its job
+forgejo-berth pause --config /etc/forgejo-berth/config.yml --stop ci-1/ci-a   # at once
+forgejo-berth resume --config /etc/forgejo-berth/config.yml ci-1/ci-a
+```
+
+A paused slot takes no new assignment. A runner it holds that has no job yet is stopped (the
+broker starts another one elsewhere); a job it runs runs to its end, or with `--stop` is cut at
+once. Then the slot is reset as after every job and stays `paused`: an Incus container restored
+and running, untouched until it is resumed; a Docker slot without containers. Resumed, it is
+reset again (an Incus container restored from its snapshot, which may be a new one) and is
+`ready`. The slot reports `paused` in its state and in `forgejo_berth_cycle_state`.
+
+The pause is a file beside the slot's state (`<state_dir>/[<host>/]<slot>.pause`), so it
+survives a restart of the broker or of the cycle: a slot still paused is left as it is, not
+reset. With the `docker` and `incus` providers `forgejo-berth pause` writes it into the
+broker's `state_dir` (run it as the broker's user); with `ssh` it asks the host's slot command,
+which can be run on the host as well (`forgejo-berth slot -- "pause ci-a"`). An SSH host's
+default `state_dir` is under `/run`: a pause there does not survive the host's reboot unless
+`state_dir` is on disk.
 
 ## Observability
 

@@ -184,3 +184,52 @@ func (s *syncSystem) TookTask() bool            { return false }
 func (s *syncSystem) SaveJournal()              {}
 func (s *syncSystem) Measure() (int64, int)     { return 0, 0 }
 func (s *syncSystem) CPU() (int64, int64, bool) { return 0, 0, false }
+
+// A slot of the broker's own paused through the provider: its cycle holds it, the broker's
+// status shows it, and resumed it is ready again.
+func TestALocalSlotPausesAndResumes(t *testing.T) {
+	dir := t.TempDir()
+	s := &Settings{Container: "ci", StateDir: filepath.Join(dir, "state"), ConfigTemplate: "/dev/null",
+		LabelTables: map[string]map[string]string{"trusted": {"ubuntu-latest": "ubuntu-latest:host"}}}
+	s.defaults()
+	s.Interval = 0.01
+	l, err := NewLocal(map[string]*Settings{"ci": s})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Start(func(*Settings) System { return &syncSystem{} }, slog.New(slog.DiscardHandler))
+	defer l.Stop()
+	h := Hosted{"ci-1": l}
+	host := config.Host{Name: "ci-1"}
+	wait := func(state string, paused bool) {
+		t.Helper()
+		for range 500 {
+			slots, err := h.Status(context.Background(), host)
+			if err == nil && len(slots) == 1 && slots[0].State == state && slots[0].Paused == paused {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("never %s (paused %v)", state, paused)
+	}
+	wait(provider.Ready, false)
+	if _, err := h.Pause(context.Background(), host, "ci", false); err != nil {
+		t.Fatal(err)
+	}
+	wait(provider.Paused, true)
+	if cycles := h.Cycles(); cycles[0].State != provider.Paused {
+		t.Fatalf("cycles %+v", cycles)
+	}
+	handoff := provider.Handoff{Assignment: "ci-1-ci-1-7", UUID: testUUID, Token: testToken,
+		Labels: []string{"ubuntu-latest"}, Class: "trusted", UnusedMinutes: 15}
+	if err := h.Assign(context.Background(), host, "ci", handoff); err == nil {
+		t.Fatal("a paused slot took an assignment")
+	}
+	if state, err := h.Resume(context.Background(), host, "ci"); err != nil || state != provider.Paused {
+		t.Fatalf("resume: %q %v", state, err)
+	}
+	wait(provider.Ready, false)
+	if _, err := h.Pause(context.Background(), config.Host{Name: "ci-2"}, "ci", false); err == nil {
+		t.Fatal("an unknown host was paused")
+	}
+}

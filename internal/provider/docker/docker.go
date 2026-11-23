@@ -22,17 +22,11 @@ func Settings(s config.Slots, host, name string) *slot.Settings {
 	return settings
 }
 
-// New makes the provider of the configuration's hosts. Its cycles run once started (never
-// in shadow mode, which only reads the slots' state); Stop ends them and leaves the
-// containers to the next start.
-func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
-	d := cfg.Provider.Docker
+// Slots are the hosts' slot sides, their cycles not started: what pausing and resuming a
+// slot changes (their state directories).
+func Slots(cfg *config.Config) (slot.Hosted, error) {
 	hosted := slot.Hosted{}
 	for _, h := range cfg.Hosts {
-		engine, err := NewEngine(h.Address, cfg.HostTLS(h))
-		if err != nil {
-			return nil, err
-		}
 		slots := map[string]*slot.Settings{}
 		for _, name := range h.Slots {
 			slots[name] = Settings(cfg.HostSlots(h), h.Name, name)
@@ -41,6 +35,26 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 		if err != nil {
 			return nil, err
 		}
+		hosted[h.Name] = local
+	}
+	return hosted, nil
+}
+
+// New makes the provider of the configuration's hosts. Its cycles run once started (never
+// in shadow mode, which only reads the slots' state); Stop ends them and leaves the
+// containers to the next start.
+func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
+	d := cfg.Provider.Docker
+	hosted, err := Slots(cfg)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range cfg.Hosts {
+		engine, err := NewEngine(h.Address, cfg.HostTLS(h))
+		if err != nil {
+			return nil, err
+		}
+		local := hosted[h.Name]
 		local.Ping = func(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, durationSeconds(d.TimeoutSeconds))
 			defer cancel()
@@ -52,7 +66,6 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 				return NewSystem(engine, d, s, h.Name, prefix+s.Container, log)
 			}, log.With("host", h.Name))
 		}
-		hosted[h.Name] = local
 	}
 	return hosted, nil
 }
