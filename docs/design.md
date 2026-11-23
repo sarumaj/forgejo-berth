@@ -206,11 +206,13 @@ The broker runs `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i <key> -p <
 <user>@<address> <command>`. The host's `authorized_keys` forces the command, for example:
 
 ```text
-restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA…
+restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot -- \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA…
 ```
 
 `forgejo-berth slot` takes the whole requested command as one argument (or from
-`SSH_ORIGINAL_COMMAND`) and knows three commands. Anything else exits 1 with a usage line.
+`SSH_ORIGINAL_COMMAND`) and knows three commands. Anything else exits 1 with a usage line. The
+argument follows `--`, which ends the command's own flags: a request beginning with `-` is then
+a request (refused), never a flag such as `--settings-dir`.
 
 `status` prints JSON on standard output. Tokens are never part of it.
 

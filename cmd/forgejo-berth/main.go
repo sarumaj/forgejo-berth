@@ -5,7 +5,7 @@
 //
 //	forgejo-berth run [--config FILE] [--shadow]        the broker
 //	forgejo-berth check [--config FILE]                 checks the configuration and the secrets
-//	forgejo-berth slot [--settings-dir DIR] [REQUEST]   the slot's forced SSH command
+//	forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]  the slot's forced SSH command
 //	forgejo-berth cycle [--settings-dir DIR] CONTAINER  one slot's reset cycle
 //	forgejo-berth version
 package main
@@ -46,7 +46,7 @@ const (
 	defaultSettingsDir = "/etc/forgejo-berth/slots"
 	usage              = `usage: forgejo-berth run [--config FILE] [--shadow]
        forgejo-berth check [--config FILE]
-       forgejo-berth slot [--settings-dir DIR] [REQUEST]
+       forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]
        forgejo-berth cycle [--settings-dir DIR] [--log-format text|json] CONTAINER
        forgejo-berth version`
 )
@@ -286,11 +286,15 @@ func look(ctx context.Context, b *broker.Broker, cfg *config.Config, log *slog.L
 	}
 }
 
+// runSlot is the slot's forced command. The request is one argument, after the flags; after
+// "--" it is never taken for a flag, whatever it begins with, so a forced command of the form
+// slot -- "$SSH_ORIGINAL_COMMAND" cannot be given flags by the request.
 func runSlot(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("slot", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dir := fs.String("settings-dir", defaultSettingsDir, "the slots' settings")
 	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "usage: forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]")
 		return 2
 	}
 	request := os.Getenv("SSH_ORIGINAL_COMMAND")

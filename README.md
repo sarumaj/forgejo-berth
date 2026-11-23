@@ -144,7 +144,7 @@ Put `forgejo-berth` on every CI host too.
 3. Add an account (here `berth`) whose one key is the broker's, forced to the slot command:
 
    ```text
-   restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA… forgejo-berth
+   restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot -- \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA… forgejo-berth
    ```
 
    and let it run that command as root ([examples/sudoers](examples/sudoers)).
@@ -297,7 +297,9 @@ instance's state (`memory.usage_peak` plus `swap_usage_peak`; the container's ow
 ## Slot protocol
 
 The broker runs one of three commands over SSH; the host's key forces `forgejo-berth slot`,
-which takes the requested command as its one argument (or from `SSH_ORIGINAL_COMMAND`).
+which takes the requested command as its one argument (or from `SSH_ORIGINAL_COMMAND`). Put
+`--` before the argument, as above: a request after `--` is never taken for a flag, whatever it
+begins with (without it, one beginning with `-` would be parsed as the command's flags).
 
 | Command                            | Input           | Output                                      |
 | ---------------------------------- | --------------- | ------------------------------------------- |
