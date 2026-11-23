@@ -3,6 +3,7 @@
 package incus
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -589,5 +590,36 @@ func TestASlotsOwnCacheVolumeIsMade(t *testing.T) {
 	f.mu.Unlock()
 	if err := instance.SetCache(t.Context(), "other-pool", "x", "/cache"); err == nil {
 		t.Fatal("a volume of a pool that is not there was attached")
+	}
+}
+
+// The runner's journal goes into the broker's log at info, line by line, and at warn when
+// the runner failed: a runner that does not start is seen without debug logging.
+func TestTheRunnersJournalIsInTheLog(t *testing.T) {
+	f := newFakeIncus()
+	f.status = "Running"
+	f.journal = "2026-11-24T10:00:00+0000 ci runner[1]: level=info msg=\"Starting runner daemon\"\n" +
+		"2026-11-24T10:00:01+0000 ci runner[1]: level=error msg=\"cannot reach the instance\"\n"
+	client, _, _ := serveTLS(t, f)
+	var logs bytes.Buffer
+	system := slot.NewIncusOn(testSettings(t), NewInstance(client, "ci", 5*time.Second))
+	system.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	system.SaveJournal(false)
+	if n := strings.Count(logs.String(), "level=INFO msg=runner line="); n != 2 ||
+		!strings.Contains(logs.String(), `cannot reach the instance`) {
+		t.Fatalf("log:\n%s", logs.String())
+	}
+	logs.Reset()
+	system.SaveJournal(true)
+	if n := strings.Count(logs.String(), "level=WARN msg=runner line="); n != 2 {
+		t.Fatalf("log of a failed runner:\n%s", logs.String())
+	}
+	logs.Reset()
+	f.mu.Lock()
+	f.status = "Stopped"
+	f.mu.Unlock()
+	system.SaveJournal(true)
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "not running") {
+		t.Fatalf("log of a failed runner whose container stopped:\n%s", logs.String())
 	}
 }

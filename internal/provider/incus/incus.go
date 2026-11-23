@@ -70,26 +70,13 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 			hostLog := log.With("host", h.Name)
 			local.Start(func(s *slot.Settings) slot.System {
 				system := slot.NewIncusOn(s, NewInstance(client, s.Container, timeout))
-				system.Out = journal{log: hostLog.With("container", s.Container)}
+				// The runner's journal in the broker's log, as an SSH host's cycle has it in
+				// its own: a runner that fails to start is seen without debug logging.
+				system.Log = hostLog.With("container", s.Container)
 				return system
 			}, hostLog)
 		}
 		hosted[h.Name] = local
 	}
 	return hosted, nil
-}
-
-// journal puts the runner's journal, as the cycle prints it, into the broker's log.
-type journal struct{ log *slog.Logger }
-
-func (j journal) Write(p []byte) (int, error) {
-	j.log.Debug("runner", "line", string(trimNewline(p)))
-	return len(p), nil
-}
-
-func trimNewline(p []byte) []byte {
-	if n := len(p); n > 0 && p[n-1] == '\n' {
-		return p[:n-1]
-	}
-	return p
 }

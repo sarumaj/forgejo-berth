@@ -327,9 +327,10 @@ func (d *System) Busy() bool { return d.task() != 0 }
 // TookTask tells whether the runner's log shows it took a task.
 func (d *System) TookTask() bool { return d.task() != 0 }
 
-// SaveJournal logs the runner's output, its last journal_lines, as one record (debug): the
-// container goes at the next reset. A job's own output is Forgejo's, not the runner's.
-func (d *System) SaveJournal() {
+// SaveJournal logs the runner's output, its last journal_lines, as one record: the container
+// goes at the next reset. At debug, but at warn when the runner failed, its output then the
+// only account of why. A job's own output is Forgejo's, not the runner's.
+func (d *System) SaveJournal(failed bool) {
 	ctx, cancel := d.ctx(1)
 	defer cancel()
 	logs, err := d.engine.Logs(ctx, d.name, d.settings.JournalLines)
@@ -337,7 +338,11 @@ func (d *System) SaveJournal() {
 		d.log.Warn("the runner's log could not be read", "error", err)
 		return
 	}
-	d.log.Debug("the runner's log", "log", strings.TrimRight(logs, "\n"))
+	level := slog.LevelDebug
+	if failed {
+		level = slog.LevelWarn
+	}
+	d.log.Log(context.Background(), level, "the runner's log", "log", strings.TrimRight(logs, "\n"))
 }
 
 // containers are the slot's containers whose cgroups count: the runner's, and its Docker's,

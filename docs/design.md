@@ -396,6 +396,14 @@ reads and changes it. Two implement it:
 | peak         | the cgroup's `memory.peak`, `memory.swap.peak`   | the state's `memory.usage_peak`, `swap_usage_peak`         |
 | CPU          | the cgroup's `cpu.stat`, `cpu.pressure`          | the same files, read by `exec` from inside                 |
 
+After each runner the cycle saves the runner's journal of this boot (`journalctl --boot
+--unit=<runner_service>`, its last `journal_lines`): an SSH host's cycle prints it to its own
+output (the unit's journal), the incus provider's into the broker's log, a record per line at
+info. When the runner failed (its service did not start, or it exited within a minute without
+a job), the lines are at warn: the journal is the only account of why, and the next reset
+loses it. The docker provider logs the runner container's output as one record, at debug, at
+warn for a failed runner.
+
 Inside a container, cgroup v2 with its cgroup namespace shows the container's own cgroup at
 `/sys/fs/cgroup`, the tree the host sees under `lxc.payload.<c>`. The runner is looked at once
 for both questions of a look (active, busy). An answer that does not come (the API away for a

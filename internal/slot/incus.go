@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"regexp"
 	"strconv"
@@ -69,8 +70,10 @@ type Instance interface {
 type Incus struct {
 	settings *Settings
 	instance Instance
-	// Out gets the runner's journal (SaveJournal).
+	// Out gets the runner's journal (SaveJournal), unless Log is set: then each line is a
+	// record of it, at info (warn when the runner failed).
 	Out io.Writer
+	Log *slog.Logger
 }
 
 // NewIncus makes the system of a container on this host, through the incus command.
@@ -300,18 +303,35 @@ func (i *Incus) TookTask() bool {
 	return i.task() != 0
 }
 
-// SaveJournal prints the runner's journal of this boot into the cycle's.
-func (i *Incus) SaveJournal() {
+// SaveJournal prints the runner's journal of this boot into the cycle's: a line each, as
+// "runner: <line>" on Out, or a record of Log, at info (warn when the runner failed, its
+// journal then the only account of why).
+func (i *Incus) SaveJournal(failed bool) {
+	level := slog.LevelInfo
+	if failed {
+		level = slog.LevelWarn
+	}
 	if up, err := i.running(); err != nil || !up {
+		if failed && i.Log != nil {
+			i.Log.Warn("the runner's journal could not be read: the container is not running", "error", err)
+		}
 		return
 	}
 	out, err := i.journal("short-iso", i.settings.JournalLines)
 	if err != nil {
-		fmt.Fprintf(i.Out, "the runner's journal could not be read: %v\n", err)
+		if i.Log != nil {
+			i.Log.Log(context.Background(), level, "the runner's journal could not be read", "error", err)
+		} else {
+			fmt.Fprintf(i.Out, "the runner's journal could not be read: %v\n", err)
+		}
 		return
 	}
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-		fmt.Fprintf(i.Out, "runner: %s\n", line)
+		if i.Log != nil {
+			i.Log.Log(context.Background(), level, "runner", "line", line)
+		} else {
+			fmt.Fprintf(i.Out, "runner: %s\n", line)
+		}
 	}
 }
 

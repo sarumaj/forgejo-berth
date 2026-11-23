@@ -41,8 +41,9 @@ type System interface {
 	// TookTask tells whether the runner's journal shows it took a task, though no step
 	// shows yet (an image still pulling).
 	TookTask() bool
-	// SaveJournal copies the runner's journal of this boot into the cycle's log.
-	SaveJournal()
+	// SaveJournal copies the runner's journal of this boot into the cycle's log; failed
+	// says that the runner failed (it did not start, or exited at once without a job).
+	SaveJournal(failed bool)
 	// Measure returns the task the runner ran (0: none) and the most memory the container
 	// used, swap included (MiB).
 	Measure() (int64, int)
@@ -263,6 +264,7 @@ func (c *Cycle) Serve(a provider.Parsed) bool {
 	if err != nil {
 		c.failures++
 		c.log.Error("the runner did not start", "in_a_row", c.failures, "error", err)
+		c.system.SaveJournal(true)
 		c.finish(a, time.Time{}, c.now())
 		c.setState(provider.Failed)
 		return false
@@ -324,7 +326,8 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 			break
 		}
 	}
-	c.system.SaveJournal()
+	failed := jobSince.IsZero() && c.now().Sub(started).Seconds() < quickExit && !pausedOut
+	c.system.SaveJournal(failed)
 	c.finish(a, jobSince, c.now())
 	if !jobSince.IsZero() {
 		c.jobs++
@@ -332,7 +335,7 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 		c.write()
 		return true
 	}
-	if c.now().Sub(started).Seconds() < quickExit && !pausedOut {
+	if failed {
 		c.failures++
 		c.log.Error("the runner exited without a job", "in_a_row", c.failures)
 		c.setState(provider.Failed)
@@ -417,7 +420,7 @@ func (c *Cycle) Resume() bool {
 		jobSince = served
 	}
 	c.log.Info("its runner ended while no cycle watched it", "assignment", a.ID)
-	c.system.SaveJournal()
+	c.system.SaveJournal(false)
 	c.finish(a, jobSince, c.now())
 	if !jobSince.IsZero() {
 		c.jobs++

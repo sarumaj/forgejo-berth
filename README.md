@@ -297,8 +297,11 @@ the snapshot, start, wait for systemd; attach the class's cache volume, push the
 configuration and token through the file API, start the runner; watch it with `exec` (its cgroup
 seen from inside); after the job, the peak from the instance's state (`memory.usage_peak` plus
 `swap_usage_peak`; the container's own `memory.peak` where the server reports none), the CPU
-from its cgroup. The state is in `state_dir`, as for Docker. The runner's journal is in the
-broker's log at debug level.
+from its cgroup. The state is in `state_dir`, as for Docker. After each runner, its journal is
+in the broker's log, a record (`msg=runner`) per line at info, as an SSH host's cycle has it in
+its own; at warn when the runner failed (it did not start, or exited at once without a job),
+so that the reason is there without debug logging. A Docker slot's runner log is one record, at
+debug, or at warn when the runner failed.
 
 ## Cache volumes
 

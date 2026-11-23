@@ -95,7 +95,13 @@ func (f *fakeSystem) TookTask() bool {
 	return f.took
 }
 
-func (f *fakeSystem) SaveJournal() { f.calls = append(f.calls, "journal") }
+func (f *fakeSystem) SaveJournal(failed bool) {
+	if failed {
+		f.calls = append(f.calls, "journal failed")
+		return
+	}
+	f.calls = append(f.calls, "journal")
+}
 
 func (f *fakeSystem) CPU() (int64, int64, bool) {
 	// One core busy, a tenth of the time waiting: the counters follow the clock.
@@ -275,7 +281,8 @@ func TestReportsARunnerItCouldNotSetUpAsUnused(t *testing.T) {
 	c := newCycle(t, dir, sys, sys.clock.stop(100))
 	assign(t, dir, nil)
 	a, _ := c.WaitAssignment()
-	if c.Serve(a) || c.State() != "failed" || !c.Last().Unused || slices.Contains(sys.calls, "start") {
+	if c.Serve(a) || c.State() != "failed" || !c.Last().Unused || slices.Contains(sys.calls, "start") ||
+		!slices.Contains(sys.calls, "journal failed") {
 		t.Fatalf("state %s, last %+v, calls %v", c.State(), c.Last(), sys.calls)
 	}
 }
@@ -568,5 +575,17 @@ func TestASettingsFilesCacheOfItsOwn(t *testing.T) {
 		"labels: {shared: {docker: d}}\ncache_volumes: {shared: \"cache-{class}\"}\n")
 	if _, err := LoadSettings(filepath.Join(dir, "ci-b.yml")); err == nil || !strings.Contains(err.Error(), "placeholders") {
 		t.Fatalf("an unknown placeholder: %v", err)
+	}
+}
+
+// A runner that exits at once without a job failed: its journal is saved as a failure's.
+func TestARunnerThatExitsAtOnceFailed(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: []look{{false, false}}}
+	c := newCycle(t, dir, sys, sys.clock.stop(100))
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	if c.Serve(a) || c.State() != "failed" || !slices.Contains(sys.calls, "journal failed") {
+		t.Fatalf("state %s, calls %v", c.State(), sys.calls)
 	}
 }

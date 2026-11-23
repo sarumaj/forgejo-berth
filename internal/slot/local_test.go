@@ -181,7 +181,7 @@ func (s *syncSystem) RunnerActive() bool {
 }
 func (s *syncSystem) Busy() bool                { return false }
 func (s *syncSystem) TookTask() bool            { return false }
-func (s *syncSystem) SaveJournal()              {}
+func (s *syncSystem) SaveJournal(bool)          {}
 func (s *syncSystem) Measure() (int64, int)     { return 0, 0 }
 func (s *syncSystem) CPU() (int64, int64, bool) { return 0, 0, false }
 
