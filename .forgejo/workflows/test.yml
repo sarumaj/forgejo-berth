@@ -1,0 +1,100 @@
+# The checks of every change: pushes to main and to renovate/all-patch, where Renovate's
+# patches merge from once this passes (no ignoreTests in renovate.json), and pull requests.
+name: Test
+# A failed job mails whoever started the run. Renovate's bot has no mailbox: when its
+# branch fails, Renovate opens a pull request, which mails the repository's watchers.
+enable-email-notifications: true
+"on":
+  push:
+    branches: [main, renovate/all-patch]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: docker
+    # Debian's Go image: bash, curl, git, gcc (for -race) and Python 3 (the shared actions).
+    container: docker.io/library/golang:1.27-trixie
+    timeout-minutes: 30
+    env:
+      # The image's Go, never a downloaded one: go.mod cannot claim less than it needs.
+      GOTOOLCHAIN: local
+      # Go sees the host's cores, not the job container's share: two threads keep the
+      # build of the SQLite driver within the container's memory.
+      GOMAXPROCS: "2"
+    steps:
+      - name: Check out
+        run: |
+          git init -q . && git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          auth=$(printf 'ci:%s' "${{ github.token }}" | base64 -w0)
+          git -c http.extraHeader="Authorization: Basic $auth" fetch -q --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+
+      # gofmt -l lists what is not formatted; -d alone would show it and still succeed.
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || { gofmt -s -d .; exit 1; }
+
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run --timeout 10m
+
+      # As JSON with the coverage, for the report below, which also prints the failed
+      # tests' output.
+      - name: Tests
+        id: tests
+        run: go test -race -json -coverprofile=/tmp/cover.out ./... > /tmp/go-test.json
+
+      # The results and the coverage as one comment on the pull request
+      # (dawid/ci-actions), also when tests failed.
+      - name: Test report
+        if: always() && steps.tests.outcome != 'skipped'
+        uses: https://git.ciepiela.org/dawid/ci-actions/test-report@main
+        with:
+          go-test-json: /tmp/go-test.json
+          coverage: /tmp/cover.out
+
+      # Known vulnerabilities reachable from the code (call analysis).
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # The known vulnerabilities of go.sum as a comment; the job does not fail for them.
+      - name: Dependency scan
+        if: always() && github.event_name == 'pull_request'
+        uses: https://git.ciepiela.org/dawid/ci-actions/dependency-scan@main
+        with:
+          path: .
+
+      # The release build: static binaries for both architectures, with their checksums.
+      - name: Release build
+        run: |
+          scripts/dist.sh "${GITHUB_SHA:0:7}"
+          (cd dist && sha256sum -c checksums.txt)
+          tar -xzf dist/forgejo-berth_*_linux_amd64.tar.gz -C /tmp
+          /tmp/forgejo-berth_*_linux_amd64/forgejo-berth version
+          if ldd /tmp/forgejo-berth_*_linux_amd64/forgejo-berth; then echo "::error::not static"; exit 1; fi
+
+  docs:
+    runs-on: docker
+    container: docker.io/library/node:24-trixie
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        run: |
+          git init -q . && git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          auth=$(printf 'ci:%s' "${{ github.token }}" | base64 -w0)
+          git -c http.extraHeader="Authorization: Basic $auth" fetch -q --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+
+      # Lines of at most 100 characters, tables aligned (.markdownlint.yaml).
+      - name: markdownlint
+        run: npx --yes markdownlint-cli2@0.24.2 "**/*.md"

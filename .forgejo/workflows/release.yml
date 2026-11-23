@@ -1,0 +1,55 @@
+# A release of a tag (vX.Y.Z, tagged with CHANGELOG.md from the Conventional Commits since
+# the last one): the static binaries for linux/amd64 and linux/arm64 and their checksums,
+# attached to the tag's release, with the changelog's section as its notes.
+name: Release
+"on":
+  push:
+    tags: ["v*"]
+  # Run by hand to retry a tag's release, with the tag in the field.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to release (vX.Y.Z)
+        type: string
+        required: true
+
+jobs:
+  release:
+    runs-on: docker
+    container: docker.io/library/golang:1.27-trixie
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GOTOOLCHAIN: local
+      GOMAXPROCS: "2"
+    steps:
+      - name: Check the tag
+        run: |
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::$TAG is not a release tag"; exit 1 ;;
+          esac
+
+      - name: Check out the tag
+        run: |
+          git init -q . && git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          auth=$(printf 'ci:%s' "${{ github.token }}" | base64 -w0)
+          git -c http.extraHeader="Authorization: Basic $auth" fetch -q --tags origin
+          git checkout -q "refs/tags/$TAG"
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: |
+          scripts/dist.sh "$TAG"
+          tar -xzf dist/forgejo-berth_*_linux_amd64.tar.gz -C /tmp
+          /tmp/forgejo-berth_*_linux_amd64/forgejo-berth version | grep -Fx "$TAG"
+
+      # The changelog's section of the version, else the commits since the last tag. The
+      # release is made (or found) through the API, and every file replaces one of its name.
+      - name: Publish the release
+        env:
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: scripts/publish.sh
