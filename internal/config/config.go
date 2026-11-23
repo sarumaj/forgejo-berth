@@ -48,6 +48,9 @@ type Config struct {
 	Listen string `yaml:"listen"`
 	// StateFile, when set, gets the state document after every look.
 	StateFile string `yaml:"state_file"`
+	// MetricsFile, when set, gets the metrics after every look, for node_exporter's textfile
+	// collector (a .prom file in its directory) where the endpoint is not scraped.
+	MetricsFile string `yaml:"metrics_file"`
 	// Shadow computes and logs decisions without acting on them.
 	Shadow bool `yaml:"shadow"`
 	Log    Log  `yaml:"log"`

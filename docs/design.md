@@ -373,7 +373,8 @@ starts there until the job fits.
   and in shadow mode `would_assign`.
 - `GET /state`: JSON (`last_tick`, `waiting`, `unservable`, `hosts` with `reachable` and
   `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`). The same
-  document can be written to `state_file` atomically, for tools that read files.
+  document can be written to `state_file` atomically, for tools that read files, and the
+  metrics to `metrics_file` (a node_exporter textfile collector's `.prom` file).
 - `GET /healthz`: 200 while the last look is younger than three intervals.
 - Logs: `log/slog`, text or JSON (`log.format`), one line per decision.
 

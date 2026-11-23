@@ -35,6 +35,7 @@ var ErrReadOnly = errors.New("the history is read-only")
 
 // History is the database.
 type History struct {
+	path     string
 	db       *sql.DB
 	readOnly bool
 	// cpu tells whether the runs table has the CPU columns (a read-only older database may
@@ -70,7 +71,7 @@ func Open(path string, readOnly bool) (*History, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	h := &History{db: db, readOnly: readOnly}
+	h := &History{path: path, db: db, readOnly: readOnly}
 	if !readOnly {
 		if _, err := db.Exec(schema); err != nil {
 			_ = db.Close()
@@ -123,6 +124,11 @@ func (h *History) columns() (map[string]bool, error) {
 // Close closes the database.
 func (h *History) Close() error {
 	return h.db.Close()
+}
+
+// Path returns the database's file.
+func (h *History) Path() string {
+	return h.path
 }
 
 // ReadOnly tells whether the history was opened for reading only.

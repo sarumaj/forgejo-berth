@@ -168,7 +168,7 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	defer hist.Close()
 	b, err := broker.New(cfg, broker.Options{
-		Forge:    forgejo.New(cfg.Forgejo.URL, admin, owners, nil),
+		Forge:    forgejo.New(cfg.Forgejo.URL, admin, owners, nil).WithLog(log),
 		Provider: provider.NewSSH(cfg.Provider.SSH, nil),
 		History:  hist,
 		Log:      log,
@@ -214,6 +214,11 @@ func look(ctx context.Context, b *broker.Broker, cfg *config.Config, log *slog.L
 	}()
 	if err := b.Tick(ctx); err != nil && ctx.Err() == nil {
 		log.Error("this look failed", "error", err)
+	}
+	if cfg.MetricsFile != "" {
+		if err := broker.WriteFile(cfg.MetricsFile, []byte(b.Snapshot().Metrics()), 0o644); err != nil {
+			log.Error("the metrics file was not written", "error", err)
+		}
 	}
 	if cfg.StateFile != "" {
 		data, _ := json.MarshalIndent(b.Snapshot(), "", "  ")

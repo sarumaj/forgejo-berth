@@ -143,6 +143,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `runner_prefix`                       | `berth-`                                | runner names; the sweep deletes only these                           |
 | `listen`                              | none                                    | address of `/metrics`, `/state`, `/healthz`                          |
 | `state_file`                          | none                                    | the state document, written after every look                         |
+| `metrics_file`                        | none                                    | the metrics, written after every look (node_exporter textfile)       |
 | `shadow`                              | false                                   | compute and log, act on nothing                                      |
 | `log.format`, `log.level`             | `text`, `info`                          | `json`; `debug`, `warn`, `error`                                     |
 

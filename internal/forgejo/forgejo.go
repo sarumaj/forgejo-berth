@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -47,6 +48,13 @@ type Client struct {
 	http   *http.Client
 	mu     sync.Mutex
 	repos  map[int64][2]string
+	log    *slog.Logger
+}
+
+// WithLog sets the logger of what the client skips (a job whose repository cannot be read).
+func (c *Client) WithLog(log *slog.Logger) *Client {
+	c.log = log
+	return c
 }
 
 // New makes a client of the instance at baseURL; owners maps a trusted owner to a token of
@@ -61,6 +69,7 @@ func New(baseURL, adminToken string, owners map[string]string, client *http.Clie
 		owners: owners,
 		http:   client,
 		repos:  map[int64][2]string{},
+		log:    slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -237,10 +246,12 @@ func (c *Client) WaitingJobs(ctx context.Context) ([]broker.Job, error) {
 		id, repoID := number(r["id"]), number(r["repo_id"])
 		name, okName := r["name"].(string)
 		if id == 0 || repoID == 0 || !okName {
+			c.log.Warn("a waiting job out of shape is skipped", "job", r["id"])
 			continue
 		}
 		owner, repo, err := c.repo(ctx, repoID)
 		if err != nil {
+			c.log.Warn("a waiting job is skipped", "job", id, "error", err)
 			continue
 		}
 		var labels []string
