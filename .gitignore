@@ -1,0 +1,5 @@
+# Build output.
+/dist/
+/forgejo-berth
+*.test
+*.out

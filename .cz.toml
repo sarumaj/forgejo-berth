@@ -1,0 +1,7 @@
+# Releases are tagged from the Conventional Commits since the last tag, and CHANGELOG.md is
+# written with them (Commitizen); cz works locally too.
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+# The tag is the version: the release workflow builds it in.
+version_provider = "scm"
