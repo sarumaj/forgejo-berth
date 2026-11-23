@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -34,6 +35,24 @@ import (
 	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 )
+
+// syncBuffer is a log buffer the cycles' goroutines write to while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func env(t *testing.T, name string) string {
 	t.Helper()
@@ -265,29 +284,8 @@ jobs:
 `
 
 func TestRealForgejo(t *testing.T) {
-	base := env(t, "BERTH_REAL_URL")
 	inner := env(t, "BERTH_REAL_INNER_URL")
-	adminFile := env(t, "BERTH_REAL_ADMIN_TOKEN_FILE")
-	aliceFile := env(t, "BERTH_REAL_ALICE_TOKEN_FILE")
 	dir := t.TempDir()
-	cfg, err := config.Parse([]byte(fmt.Sprintf(`
-forgejo: {url: %s, admin_token_file: %s}
-trusted: {owners: {alice: %s}, labels: [ubuntu-latest, docker]}
-shared: {labels: [docker]}
-hosts: [{name: ci-1, address: localhost, memory_mib: 4000}]
-estimate: {unknown_mib: 1500}
-interval_seconds: 2
-`, base, adminFile, aliceFile)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	admin, _ := config.ReadSecret(adminFile)
-	alice, _ := config.ReadSecret(aliceFile)
-	hist, err := history.Open(filepath.Join(dir, "history.sqlite"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hist.Close()
 	slots := &dockerSlots{t: t, image: env(t, "BERTH_REAL_RUNNER_IMAGE"), network: env(t, "BERTH_REAL_NETWORK"),
 		url: inner, dir: dir, names: []string{"a", "b", "c"}, assigned: map[string]string{},
 		last: map[string]provider.Slot{}}
@@ -296,10 +294,44 @@ interval_seconds: 2
 			_, _ = docker("rm", "-f", slots.container(n))
 		}
 	}()
-	var logs bytes.Buffer
+	scenario(t, "hosts: [{name: ci-1, address: localhost, memory_mib: 4000}]\n",
+		func(*config.Config, *slog.Logger) provider.Provider { return slots })
+}
+
+// scenario runs two owners' workflows through the broker with the provider: the broker
+// learns their peaks and CPU use, and the next build reserves its own peak with the margin.
+func scenario(t *testing.T, hosts string, slots func(*config.Config, *slog.Logger) provider.Provider) {
+	base := env(t, "BERTH_REAL_URL")
+	adminFile := env(t, "BERTH_REAL_ADMIN_TOKEN_FILE")
+	aliceFile := env(t, "BERTH_REAL_ALICE_TOKEN_FILE")
+	dir := t.TempDir()
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`
+forgejo: {url: %s, admin_token_file: %s}
+trusted: {owners: {alice: %s}, labels: [ubuntu-latest, docker]}
+shared: {labels: [docker]}
+estimate: {unknown_mib: 1500}
+interval_seconds: 2
+history: {path: %s}
+`, base, adminFile, aliceFile, filepath.Join(dir, "history.sqlite")) + hosts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, _ := config.ReadSecret(adminFile)
+	alice, _ := config.ReadSecret(aliceFile)
+	hist, err := history.Open(cfg.History.Path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hist.Close()
+	var logs syncBuffer
+	var out io.Writer = &logs
+	if os.Getenv("BERTH_REAL_VERBOSE") != "" {
+		out = io.MultiWriter(&logs, os.Stderr)
+	}
+	log := slog.New(slog.NewTextHandler(out, nil))
 	b, err := broker.New(cfg, broker.Options{
 		Forge:    forgejo.New(base, admin, map[string]string{"alice": alice}, nil),
-		Provider: slots, History: hist, Log: slog.New(slog.NewTextHandler(&logs, nil)),
+		Provider: slots(cfg, log), History: hist, Log: log,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +344,11 @@ interval_seconds: 2
 			if err := b.Tick(ctx); err != nil {
 				t.Logf("tick: %v", err)
 			}
-			if b.Counts()["learned"] >= learned && len(b.Assignments()) == 0 && b.Snapshot().Waiting == 0 {
+			// A global runner may take an older job of a trusted owner that the broker
+			// expected an owner's runner to take: that run is not learned (unlearned).
+			c := b.Counts()
+			if c["learned"]+c["unlearned"] >= learned && c["learned"] >= learned-1 &&
+				len(b.Assignments()) == 0 && b.Snapshot().Waiting == 0 {
 				return
 			}
 			time.Sleep(2 * time.Second)
