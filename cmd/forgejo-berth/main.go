@@ -32,6 +32,8 @@ import (
 	"git.ciepiela.org/dawid/forgejo-berth/internal/forgejo"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/history"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
+	"git.ciepiela.org/dawid/forgejo-berth/internal/provider/docker"
+	"git.ciepiela.org/dawid/forgejo-berth/internal/provider/incus"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/web"
 )
@@ -121,8 +123,8 @@ func check(args []string, stdout, stderr io.Writer) int {
 	if err == nil {
 		_, _, err = tokens(cfg)
 	}
-	if err == nil && cfg.Provider.SSH.KeyFile != "" {
-		_, err = os.Stat(config.Secret(cfg.Provider.SSH.KeyFile))
+	if err == nil {
+		err = checkFiles(cfg)
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -130,6 +132,37 @@ func check(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "the configuration is valid: %d hosts, %d trusted owners\n", len(cfg.Hosts), len(cfg.Trusted.Owners))
 	return 0
+}
+
+// checkFiles checks that the provider's files are there: the SSH key, or the TLS files
+// and the runner's configuration template.
+func checkFiles(cfg *config.Config) error {
+	var files, secrets []string
+	p := cfg.Provider
+	switch p.Type {
+	case config.ProviderSSH:
+		secrets = []string{p.SSH.KeyFile}
+	case config.ProviderDocker:
+		files = []string{p.Docker.TLS.CAFile, p.Docker.TLS.CertFile, p.Docker.ConfigTemplate}
+		secrets = []string{p.Docker.TLS.KeyFile}
+	case config.ProviderIncus:
+		files = []string{p.Incus.TLS.CAFile, p.Incus.TLS.CertFile, p.Incus.ConfigTemplate}
+		secrets = []string{p.Incus.TLS.KeyFile}
+	}
+	for _, f := range secrets {
+		if f != "" {
+			files = append(files, config.Secret(f))
+		}
+	}
+	for _, f := range files {
+		if f == "" {
+			continue
+		}
+		if _, err := os.Stat(f); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runBroker(args []string, stderr io.Writer) int {
@@ -167,9 +200,14 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 	defer hist.Close()
+	slots, stopSlots, err := newProvider(cfg, log)
+	if err != nil {
+		return err
+	}
+	defer stopSlots()
 	b, err := broker.New(cfg, broker.Options{
 		Forge:    forgejo.New(cfg.Forgejo.URL, admin, owners, nil).WithLog(log),
-		Provider: provider.NewSSH(cfg.Provider.SSH, nil),
+		Provider: slots,
 		History:  hist,
 		Log:      log,
 	})
@@ -203,6 +241,26 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		case <-time.After(interval):
 		}
 	}
+}
+
+// newProvider makes the configuration's provider, and what stops it: the docker and incus
+// providers run the slots' cycles in this process.
+func newProvider(cfg *config.Config, log *slog.Logger) (provider.Provider, func(), error) {
+	switch cfg.Provider.Type {
+	case config.ProviderDocker:
+		hosted, err := docker.New(cfg, log)
+		if err != nil {
+			return nil, nil, err
+		}
+		return hosted, hosted.Stop, nil
+	case config.ProviderIncus:
+		hosted, err := incus.New(cfg, log)
+		if err != nil {
+			return nil, nil, err
+		}
+		return hosted, hosted.Stop, nil
+	}
+	return provider.NewSSH(cfg.Provider.SSH, nil), func() {}, nil
 }
 
 // look runs one tick; a failure (or a panic) is logged and the next look may succeed.

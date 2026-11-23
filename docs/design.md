@@ -23,6 +23,7 @@ Goals:
   everyone else gets the shared labels only.
 - One static binary (`CGO_ENABLED=0`): the broker, the slot's forced command and the reset
   cycle.
+- Usable without a fleet of one's own design: one machine with Docker is enough to start.
 - A shadow mode that computes and logs decisions without acting, next to a live instance.
 
 Non-goals:
@@ -61,6 +62,34 @@ flowchart LR
   Y -- task and peak in its state --> C
 ```
 
+That is the `ssh` provider. With the `docker` provider, the slot side runs in the broker itself
+and reaches the containers through the engine's API (the `incus` provider alike, through the
+Incus API, its slots Incus containers restored from a snapshot):
+
+```mermaid
+flowchart LR
+  F[Forgejo API]
+  subgraph broker[forgejo-berth run]
+    L[look every interval]
+    S[scheduler]
+    Y[a reset cycle per slot]
+    D[(state_dir)]
+  end
+  subgraph engine[Docker Engine]
+    R[runner container<br/>one job]
+    E[the slot's own Docker]
+  end
+  L -- waiting jobs --> F
+  L -- status --> D
+  S -- assign --> D
+  D -- assignment --> Y
+  Y -- create, start, remove --> R
+  Y -- create, start, remove --> E
+  R -- job containers --> E
+  R -- takes one job --> F
+  Y -- task and peak --> D
+```
+
 The broker is one loop. Every `interval_seconds` it:
 
 1. asks every host for its slots (`Provider.Status`). A host that does not answer is marked
@@ -81,16 +110,18 @@ holds (left by a crash between registering and keeping).
 
 ### Packages
 
-| Package              | Role                                                                     |
-| -------------------- | ------------------------------------------------------------------------ |
-| `cmd/forgejo-berth`  | subcommands `run`, `slot`, `cycle`, `check`, `version`                   |
-| `internal/config`    | the broker's YAML configuration, defaults and validation                 |
-| `internal/broker`    | jobs, slots, assignments; offer, predict, schedule; the loop             |
-| `internal/history`   | SQLite: finished runs and the assignments held across restarts           |
-| `internal/forgejo`   | the Forgejo API client (admin and owner tokens)                          |
-| `internal/provider`  | the slot provider interface and the SSH provider                         |
-| `internal/slot`      | the host side: the forced command and the reset cycle (Incus)            |
-| `internal/web`       | `/metrics`, `/state`, `/healthz`                                         |
+| Package                    | Role                                                                                                      |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `cmd/forgejo-berth`        | subcommands `run`, `slot`, `cycle`, `check`, `version`                                                    |
+| `internal/config`          | the broker's YAML configuration, defaults and validation                                                  |
+| `internal/broker`          | jobs, slots, assignments; offer, predict, schedule; the loop                                              |
+| `internal/history`         | SQLite: finished runs and the assignments held across restarts                                            |
+| `internal/forgejo`         | the Forgejo API client (admin and owner tokens)                                                           |
+| `internal/provider`        | the slot provider interface and the SSH provider                                                          |
+| `internal/provider/docker` | the docker provider: the Engine API client and a slot's system                                            |
+| `internal/provider/incus`  | the incus provider: the Incus API client and an API `Instance`                                            |
+| `internal/slot`            | the slot side: the forced command, the reset cycle (Incus), and the slot side run in the broker (`Local`) |
+| `internal/web`             | `/metrics`, `/state`, `/healthz`                                                                          |
 
 ## Slot provider interface
 
@@ -111,22 +142,60 @@ A finished slot's peak and task id are part of `Status` (the `last` object), so 
 separate query after its job: the broker reads them at the next look, before the slot takes a
 new assignment.
 
-The first provider is `ssh`: every host is reached as one user whose authorized key forces
-`forgejo-berth slot`. The protocol is below. A local provider (Incus or Docker on the broker's
-own host) would implement the same three calls by running the slot logic in-process; the
-interface leaves room for it, none is built yet.
+Three providers implement it:
+
+- `ssh`: every host is reached as one user whose authorized key forces `forgejo-berth slot`,
+  and a `forgejo-berth cycle` per container runs on the host. The protocol is below.
+- `docker`: every host is a Docker Engine; see [Docker provider](#docker-provider).
+- `incus`: every host is an Incus server reached through its API; see
+  [Incus provider](#incus-provider).
+
+The `docker` and `incus` providers need nothing on the host. Their slot side runs in the
+broker's process (`slot.Local`): the same reset cycle per slot, and the same `status`, `assign`
+and `release` as the SSH slot command, on the same state files, kept in the broker's
+`state_dir`, one directory per host. Only the cycle's `System`, the container as the cycle
+reads and changes it, differs.
+
+### Where the slot state lives
+
+The SSH protocol keeps a slot's state on its host: the assignment waiting (`<slot>.assignment`),
+the release (`<slot>.release`), and the cycle's state (`<slot>.json`: its state, the
+assignment it serves, the last finished assignment with its task, peak, duration and CPU). A
+provider without a host-side agent keeps the same files in the broker's `state_dir`
+(default: `slots/` beside the history), and not on the containers:
+
+- the cycle needs to write its state often (every state change, every job), and the broker is
+  the only reader. Docker's labels cannot change after a container is made, and an Incus
+  config key would cost an API request per change;
+- the last finished assignment must outlive the container: a Docker slot's container is
+  removed at the reset, and an Incus snapshot restore would roll a key back;
+- one writer and one format for all providers keep the broker's view the same.
+
+The containers carry what identifies them: a Docker slot's containers and volume have the
+labels `org.forgejo-berth.host`, `org.forgejo-berth.slot` and, for the runner,
+`org.forgejo-berth.assignment`.
+
+A broker that stops leaves the slots as they are: the cycles end after their step, and no
+container is reset. At the next start each cycle **resumes** from its state file: it keeps the
+last finished assignment (which the broker may not have read yet), and takes up the assignment
+it served. A runner still active is watched to its job's end; one that ended while no cycle
+watched it is finished as it was, its time then counting the time without a cycle. A restart
+of the broker (an upgrade, say) thus neither kills jobs nor loses what they taught.
+
+A shadow broker starts no cycles: it reads the state files only, so it can point `state_dir`
+at a live instance's.
 
 ### Slot states
 
-| State       | Meaning                                                                  |
-| ----------- | ------------------------------------------------------------------------ |
-| `ready`     | reset, no runner, takes an assignment                                    |
-| `pending`   | an assignment is written but the cycle has not taken it yet              |
-| `assigned`  | the cycle took the assignment; the runner waits for its job              |
-| `running`   | the runner runs its job                                                  |
-| `resetting` | the container is being restored from its snapshot                        |
-| `failed`    | a reset or a runner start failed; the cycle backs off and tries again    |
-| `stopped`   | the cycle is not running                                                 |
+| State       | Meaning                                                               |
+| ----------- | --------------------------------------------------------------------- |
+| `ready`     | reset, no runner, takes an assignment                                 |
+| `pending`   | an assignment is written but the cycle has not taken it yet           |
+| `assigned`  | the cycle took the assignment; the runner waits for its job           |
+| `running`   | the runner runs its job                                               |
+| `resetting` | the container is being restored from its snapshot                     |
+| `failed`    | a reset or a runner start failed; the cycle backs off and tries again |
+| `stopped`   | the cycle is not running                                              |
 
 A slot is free only when it is `ready` with no assignment and no kept assignment of the broker
 names it.
@@ -167,14 +236,14 @@ with an assignment already waiting, and an assignment out of shape.
  "unused_minutes": 15}
 ```
 
-| Field            | Check                                                                 |
-| ---------------- | --------------------------------------------------------------------- |
-| `assignment`     | `[a-z0-9][a-z0-9-]{0,127}`                                            |
-| `uuid`           | a lowercase UUID                                                      |
-| `token`          | `[0-9A-Za-z_-]{20,256}`                                               |
-| `class`          | `trusted` or `shared`, and configured on the slot                     |
-| `labels`         | not empty, every name in the class's label table of the slot          |
-| `unused_minutes` | 1 to 1440                                                             |
+| Field            | Check                                                        |
+| ---------------- | ------------------------------------------------------------ |
+| `assignment`     | `[a-z0-9][a-z0-9-]{0,127}`                                   |
+| `uuid`           | a lowercase UUID                                             |
+| `token`          | `[0-9A-Za-z_-]{20,256}`                                      |
+| `class`          | `trusted` or `shared`, and configured on the slot            |
+| `labels`         | not empty, every name in the class's label table of the slot |
+| `unused_minutes` | 1 to 1440                                                    |
 
 `release <container> <assignment>` asks the cycle to stop the assignment's runner if it still
 has no job. It refuses a slot that does not hold that assignment.
@@ -208,6 +277,85 @@ step in progress and leaves the container as it is (`stopped`).
 
 The state goes to `<state_dir>/<container>.json`; the assignment to `<container>.assignment`,
 the release to `<container>.release`.
+
+## Docker provider
+
+A host's `address` is its engine: `unix:///path`, or `tcp://host:port` with TLS
+(`provider.docker.tls`: the CA, the broker's client certificate and key). The client speaks the
+Engine API with `net/http` (no SDK), without a version in the paths: an engine answers those
+with its own version's shapes, and the fields used are the same since API 1.24, Podman's
+Docker-compatible API included. A host also names its `slots`; slot `a` of host `ci-1` is
+`<runner_prefix>ci-1-a`.
+
+The reset cycle's steps, for a Docker slot:
+
+1. **reset**: remove the slot's containers (with their anonymous volumes) and its volume; pull
+   the runner's image (and the Docker image) when the engine does not have them;
+2. **assigned**: with `job_engine: dind`, make the volume `<name>-run` and the slot's own
+   Docker `<name>-docker` (`dind_image`, privileged, `dockerd` on a socket in that volume, no
+   TCP listener), wait until it answers, and open the socket to the runner's user; then make
+   the runner's container from `image`: an init, a small `sh` wrapper, and
+   `forgejo-runner one-job --wait` with the assigned UUID, labels and `--token-url` of a file;
+   copy the token (and the configuration from `config_template`, if any) into it, owned by
+   the image's user, and start it;
+3. **running**: the runner's log shows its task line. The wrapper forwards a stop signal to the
+   runner, and when the runner exits writes a file and keeps the container up;
+4. **finish**: the task from the log, and from the runner's container and the slot's Docker
+   (whose cgroup holds the job's containers) their cgroups' `memory.peak` plus
+   `memory.swap.peak`, summed, and their `cpu.stat` and `cpu.pressure`, read by `exec` in each
+   container (cgroup v2 shows a container its own cgroup). Where there is no `memory.peak`
+   (cgroup v1), the stats API's `max_usage`. The sum of the two peaks is a little above the
+   peak of their sum: a margin on the safe side.
+
+A job short enough to start and end between two looks of the cycle is still learned: the
+runner's log shows its task (its CPU use is then not known).
+
+`job_engine` is what the job's containers run on:
+
+- `dind` (the default): the slot's own Docker, made for the job and removed after it. The job
+  can do anything to that engine and nothing to the host's other containers. Docker in Docker
+  needs a privileged container; on a rootless engine that is the engine user's privilege
+  alone. A rootless Docker inside (`docker:dind-rootless`) needs more subordinate ids than a
+  rootless engine has to give, so the rootful Docker image is the default;
+- `none`: no engine; the labels must run on the host (`label:host`), in the runner's container;
+- `host-socket`: the engine's own socket (`host_socket`) in the runner's container. Every job
+  then controls that engine: every container on it, the other slots and their tokens, and on a
+  rootful engine the host. Their containers are the engine's, not the slot's: their memory is
+  not part of the job's peak, and nothing removes what a job leaves. An explicit opt-in, for
+  trusted jobs only.
+
+## Incus provider
+
+The reset cycle's Incus logic (the boot wait and its diagnosis, the cache volume, the
+runner's files, the journal's task line) drives an `Instance`, the container as that logic
+reads and changes it. Two implement it:
+
+| Operation    | `incus` command, on the host (SSH)               | Incus API, from the broker (`incus`)                       |
+| ------------ | ------------------------------------------------ | ---------------------------------------------------------- |
+| state        | `incus query /1.0/instances/<c>/state`           | `GET /1.0/instances/<c>/state`                             |
+| stop, start  | `incus stop --force`, `incus start`              | `PUT …/state` (`action`, `force`), an operation waited for |
+| restore      | `incus snapshot restore`                         | `PUT /1.0/instances/<c>` with `restore`                    |
+| exec         | `incus exec <c> --`                              | `POST …/exec`, `record-output`; the records read, removed  |
+| write a file | `sh -c 'cat > tmp…'` from standard input         | `POST …/files` (root, 0600), then `chgrp`, `chmod`, `mv`   |
+| cache device | `incus config device remove/add`                 | `GET` the instance, `PUT` it back with `If-Match`          |
+| its log      | `incus info --show-log`                          | `GET …/logs/lxc.log`                                       |
+| the runner   | its cgroup and `/proc/<pid>/root`, from the host | one `exec` of a script reading the same from inside        |
+| peak         | the cgroup's `memory.peak`, `memory.swap.peak`   | the state's `memory.usage_peak`, `swap_usage_peak`         |
+| CPU          | the cgroup's `cpu.stat`, `cpu.pressure`          | the same files, read by `exec` from inside                 |
+
+Inside a container, cgroup v2 with its cgroup namespace shows the container's own cgroup at
+`/sys/fs/cgroup`, the tree the host sees under `lxc.payload.<c>`. The runner is looked at once
+for both questions of a look (active, busy). An answer that does not come (the API away for a
+moment) counts as active, not busy: the next look asks again, rather than ending a job that
+runs. Where the state reports no peak (a kernel or server without `memory.peak`), the
+container's own `memory.peak` is read from inside.
+
+A host's `address` is `https://host:port`, with the broker's client certificate and the
+server's certificate pinned (`tls.ca_file`: a certificate that is no CA must be the server's
+exactly; a CA checks the chain and the name), or `unix:///path`, the local socket. The
+broker's status of a host is a `GET /1.0` that must say `auth: trusted`. The client uses
+`net/http` only; the response shapes are those of the Incus REST API (sync, async with an
+operation waited for at `/1.0/operations/<id>/wait`, error).
 
 ## Configuration
 
@@ -358,16 +506,16 @@ starts there until the job fits.
 
 - `GET /metrics`: Prometheus text format, hand-written (no client library):
 
-  | Metric                              | Labels   | Kind    |
-  | ----------------------------------- | -------- | ------- |
-  | `forgejo_berth_last_tick_seconds`   |          | gauge   |
-  | `forgejo_berth_waiting_jobs`        | `kind`   | gauge   |
-  | `forgejo_berth_host_reachable`      | `host`   | gauge   |
-  | `forgejo_berth_reserved_mib`        | `host`   | gauge   |
-  | `forgejo_berth_events_total`        | `event`  | counter |
-  | `forgejo_berth_estimates`           | `source` | gauge   |
-  | `forgejo_berth_jobs_learned`        |          | gauge   |
-  | `forgejo_berth_shadow`              |          | gauge   |
+  | Metric                            | Labels   | Kind    |
+  | --------------------------------- | -------- | ------- |
+  | `forgejo_berth_last_tick_seconds` |          | gauge   |
+  | `forgejo_berth_waiting_jobs`      | `kind`   | gauge   |
+  | `forgejo_berth_host_reachable`    | `host`   | gauge   |
+  | `forgejo_berth_reserved_mib`      | `host`   | gauge   |
+  | `forgejo_berth_events_total`      | `event`  | counter |
+  | `forgejo_berth_estimates`         | `source` | gauge   |
+  | `forgejo_berth_jobs_learned`      |          | gauge   |
+  | `forgejo_berth_shadow`            |          | gauge   |
 
   Events: `assigned`, `learned`, `unlearned`, `unused`, `failed`, `underestimated`, `released`,
   and in shadow mode `would_assign`.
@@ -384,7 +532,11 @@ starts there until the job fits.
 - A runner's token exists in the broker's memory from registration until `Assign` returned; it
   is not kept in the history (the kept assignment has no token), not in the state, not in logs.
   On the host it lives in the assignment file (0600, root) until the cycle takes it, then in the
-  container until the next reset.
+  container until the next reset. With a provider whose slot side is the broker's, the
+  assignment file is in the broker's `state_dir` (0600, the broker's user) for the seconds
+  until the slot's cycle takes it.
+- A Docker slot's runner reads its token from a file of its own container (0400, the runner's
+  user); the job engine's privileges are in [Docker provider](#docker-provider).
 - SSH: `StrictHostKeyChecking=yes`, `BatchMode=yes`, the key from the configuration with
   `IdentitiesOnly=yes`; the host side forces one command and parses its arguments strictly.
 - A runner name has a configured prefix (`runner_prefix`, `berth-`): the sweep deletes runners
@@ -444,4 +596,11 @@ runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
 - An end-to-end test runs the broker against a fake Forgejo (`httptest`) and an in-memory
   provider that plays the slot's life: ready, assigned, running, finished with a peak, learned,
   and the next run packed by it.
-- The slot command and the cycle are tested on a temporary directory with a fake system.
+- The slot command and the cycle are tested on a temporary directory with a fake system; the
+  slot side run in the broker and the cycle's resume too.
+- The incus provider is tested against a fake Incus API (HTTPS with client certificates,
+  built from the REST API's documented shapes): a slot's whole life, failed operations, the
+  pinned server certificate. It is not tested against a real Incus server yet.
+- The docker provider is tested against a fake Engine API on a unix socket, and end to end by
+  `scripts/real-forgejo.sh docker`: a real Forgejo, the provider on the engine the test runs
+  on, real jobs in each slot's own Docker, learned and packed by their peaks.

@@ -112,10 +112,23 @@ func ParseStatus(host string, data []byte) ([]Slot, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("%s: its status is no JSON: %w", host, err)
 	}
-	var slots []Slot
+	var doc StatusDocument
 	for _, entry := range raw.Slots {
 		var st SlotStatus
-		if json.Unmarshal(entry, &st) != nil || st.Container == "" {
+		if json.Unmarshal(entry, &st) != nil {
+			continue
+		}
+		doc.Slots = append(doc.Slots, st)
+	}
+	return FromStatus(host, doc), nil
+}
+
+// FromStatus turns a slot side's status into the host's slots; a slot without a name is
+// skipped.
+func FromStatus(host string, doc StatusDocument) []Slot {
+	var slots []Slot
+	for _, st := range doc.Slots {
+		if st.Container == "" {
 			continue
 		}
 		slot := Slot{Host: host, Container: st.Container, State: st.State, Assignment: st.Assignment}
@@ -126,7 +139,7 @@ func ParseStatus(host string, data []byte) ([]Slot, error) {
 		}
 		slots = append(slots, slot)
 	}
-	return slots, nil
+	return slots
 }
 
 // Status runs `status` on the host.

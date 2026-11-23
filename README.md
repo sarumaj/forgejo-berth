@@ -50,9 +50,13 @@ sequenceDiagram
   B->>B: learned
 ```
 
-- **One binary.** `forgejo-berth run` is the broker; on each CI host, `forgejo-berth slot` is
-  the forced command of the broker's SSH key and `forgejo-berth cycle <container>` resets one
-  Incus container around every job.
+- **One binary.** `forgejo-berth run` is the broker. How it reaches the slots is its provider:
+  - `docker`: the slots are containers on a Docker Engine (the broker's own, or remote ones),
+    made for each job and removed after it. Nothing to install on the engine's host;
+  - `incus`: the slots are Incus containers, restored from a snapshot before every job, reached
+    through the Incus API. Nothing but Incus on the hosts;
+  - `ssh`: on each CI host, `forgejo-berth slot` is the forced command of the broker's SSH
+    key and `forgejo-berth cycle <container>` resets one Incus container around every job.
 - **Learning.** The estimate for a job is the largest peak of its last 5 runs or of its runs
   within 30 days, times 1.2. A job without runs of its own borrows from its matrix family
   (`build (32)` from `build (31)`) or its repository, times 1.5. A job of an unknown
@@ -68,10 +72,64 @@ The full design, including the rules' reasons, is in [docs/design.md](docs/desig
 ## Quick start
 
 Download a release archive (linux amd64 or arm64), check it against `checksums.txt`, and put
-`forgejo-berth` in `/usr/local/bin` on the broker's host and on every CI host.
+`forgejo-berth` in `/usr/local/bin` on the broker's host.
 
 **On Forgejo** (17 or later): an admin token with `write:admin` and `read:repository`, and for
 each trusted owner a token of theirs with `write:user`.
+
+### One machine with Docker
+
+The simplest setup: the broker and its slots on one machine with Docker (rootless Docker and
+Podman's Docker-compatible socket work too). Each job gets a runner container of its own, made
+from the runner's image, and a Docker of its own beside it for the job's containers; both are
+removed after the job. Write `/etc/forgejo-berth/config.yml`:
+
+```yaml
+forgejo:
+  url: https://forgejo.example.org
+  admin_token_file: admin.token
+shared:
+  labels: [docker]
+hosts:
+  - name: local
+    address: unix:///var/run/docker.sock
+    memory_mib: 6000
+    slots: [a, b]
+provider:
+  type: docker
+  docker:
+    labels:
+      shared: {docker: "docker:docker://node:24-trixie"}
+```
+
+then check it and run it, as a user that may use the socket
+([examples/forgejo-berth.service](examples/forgejo-berth.service); add the user to the
+`docker` group, or point `address` at a rootless engine's socket):
+
+```sh
+forgejo-berth check --config /etc/forgejo-berth/config.yml
+forgejo-berth run --config /etc/forgejo-berth/config.yml
+```
+
+A job with `runs-on: docker` now gets a runner named `berth-…`. Read
+[Docker slots](#docker-slots) before giving the slots more than throwaway jobs:
+[examples/config-docker.yml](examples/config-docker.yml) has every setting, remote engines
+included.
+
+### Incus hosts through the Incus API
+
+The hosts need Incus alone. On each, make the containers as in step 1 below (a runner unit,
+a snapshot), let the API listen (`incus config set core.https_address :8443`) and trust the
+broker's client certificate (`incus config trust add-certificate broker.crt`). On the
+broker's host, write the configuration
+([examples/config-incus.yml](examples/config-incus.yml): the hosts' `https://` addresses and
+`slots`, the server's certificate to pin, the runner's configuration template), check it and
+run it as below. Incus on the broker's own host can be reached through its socket
+(`unix:///var/lib/incus/unix.socket`).
+
+### Incus hosts over SSH
+
+Put `forgejo-berth` on every CI host too.
 
 **On each CI host** (Incus):
 
@@ -107,49 +165,133 @@ curl -s http://127.0.0.1:9877/state
 One YAML file. Unknown keys are errors. Secrets are files, never arguments: a relative secret
 path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredential`).
 
-| Key                                   | Default                                 | Meaning                                                              |
-| ------------------------------------- | --------------------------------------- | -------------------------------------------------------------------- |
-| `forgejo.url`                         | required                                | the instance                                                         |
-| `forgejo.admin_token_file`            | required                                | admin token: waiting jobs, global runners, runs' jobs                |
-| `trusted.owners`                      | none                                    | owner name to the file of their `write:user` token                   |
-| `trusted.labels`                      | none                                    | labels a trusted owner's job may ask for, besides host features      |
-| `shared.labels`                       | none                                    | labels everyone else's jobs may ask for (global runners)             |
-| `hosts[].name`                        | required                                | lowercase letters, digits, dashes                                    |
-| `hosts[].address`                     | required                                | where SSH reaches it                                                 |
-| `hosts[].memory_mib`                  | required                                | memory its slots' jobs may use together                              |
-| `hosts[].features`                    | none                                    | labels only this host offers                                         |
-| `hosts[].cpu_cores`                   | 0                                       | its cores, for `cpu.overcommit`                                      |
-| `hosts[].max_jobs`                    | 0 (no cap)                              | jobs at once                                                         |
-| `provider.type`                       | `ssh`                                   | the slot provider                                                    |
-| `provider.ssh.user`                   | `berth`                                 | the CI hosts' account                                                |
-| `provider.ssh.port`                   | 22                                      |                                                                      |
-| `provider.ssh.key_file`               | ssh's default                           | the broker's private key                                             |
-| `provider.ssh.known_hosts_file`       | ssh's default                           | host keys; checking is always strict                                 |
-| `provider.ssh.control_dir`            | none                                    | keeps connections open between looks                                 |
-| `provider.ssh.timeout_seconds`        | 20                                      | connect timeout; a request gets three times that                     |
-| `estimate.history_runs`               | 5                                       | the last runs that count                                             |
-| `estimate.spike_days`                 | 30                                      | runs within that many days count too                                 |
-| `estimate.margin`                     | 1.2                                     | on the job's own peak                                                |
-| `estimate.relative_margin`            | 1.5                                     | on a family's or repository's peak                                   |
-| `estimate.floor_mib`                  | 512                                     | the least reserved                                                   |
-| `estimate.unknown_mib`                | 6144                                    | for a job without history; 0: a host alone                           |
-| `estimate.retention_days`             | 180                                     | runs older are forgotten                                             |
-| `cpu.overcommit`                      | 0 (off)                                 | predicted cores within `cpu_cores` times this                        |
-| `cpu.unknown_cores`                   | 1                                       | cores predicted for a job without CPU history                        |
-| `history.path`                        | `/var/lib/forgejo-berth/history.sqlite` | runs and kept assignments                                            |
-| `interval_seconds`                    | 10                                      | between looks                                                        |
-| `unused_minutes`                      | 15                                      | a runner without a job is stopped after that                         |
-| `starve_minutes`                      | 10                                      | a job that fits nowhere then holds a host                            |
-| `runner_prefix`                       | `berth-`                                | runner names; the sweep deletes only these                           |
-| `listen`                              | none                                    | address of `/metrics`, `/state`, `/healthz`                          |
-| `state_file`                          | none                                    | the state document, written after every look                         |
-| `metrics_file`                        | none                                    | the metrics, written after every look (node_exporter textfile)       |
-| `shadow`                              | false                                   | compute and log, act on nothing                                      |
-| `log.format`, `log.level`             | `text`, `info`                          | `json`; `debug`, `warn`, `error`                                     |
+| Key                               | Default                                 | Meaning                                                                                 |
+| --------------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------- |
+| `forgejo.url`                     | required                                | the instance                                                                            |
+| `forgejo.admin_token_file`        | required                                | admin token: waiting jobs, global runners, runs' jobs                                   |
+| `trusted.owners`                  | none                                    | owner name to the file of their `write:user` token                                      |
+| `trusted.labels`                  | none                                    | labels a trusted owner's job may ask for, besides host features                         |
+| `shared.labels`                   | none                                    | labels everyone else's jobs may ask for (global runners)                                |
+| `hosts[].name`                    | required                                | lowercase letters, digits, dashes                                                       |
+| `hosts[].address`                 | required                                | where SSH reaches it                                                                    |
+| `hosts[].memory_mib`              | required                                | memory its slots' jobs may use together                                                 |
+| `hosts[].features`                | none                                    | labels only this host offers                                                            |
+| `hosts[].cpu_cores`               | 0                                       | its cores, for `cpu.overcommit`                                                         |
+| `hosts[].max_jobs`                | 0 (no cap)                              | jobs at once                                                                            |
+| `hosts[].slots`                   | required for `docker`, `incus`          | the slots' names (Incus: the containers'); an SSH host lists its own                    |
+| `provider.type`                   | `ssh`                                   | `ssh`, `docker` or `incus`                                                              |
+| `provider.ssh.user`               | `berth`                                 | the CI hosts' account                                                                   |
+| `provider.ssh.port`               | 22                                      |                                                                                         |
+| `provider.ssh.key_file`           | ssh's default                           | the broker's private key                                                                |
+| `provider.ssh.known_hosts_file`   | ssh's default                           | host keys; checking is always strict                                                    |
+| `provider.ssh.control_dir`        | none                                    | keeps connections open between looks                                                    |
+| `provider.ssh.timeout_seconds`    | 20                                      | connect timeout; a request gets three times that                                        |
+| `provider.docker.image`           | `data.forgejo.org/forgejo/runner:13`    | the runner's image: `sh` and `forgejo-runner` on its PATH                               |
+| `provider.docker.forgejo_url`     | `forgejo.url`                           | the instance as the runners reach it                                                    |
+| `provider.docker.job_engine`      | `dind`                                  | `dind`, `none` or `host-socket` (see [Docker slots](#docker-slots))                     |
+| `provider.docker.dind_image`      | `docker.io/library/docker:29-dind`      | the slot's own Docker                                                                   |
+| `provider.docker.dind_args`       | none                                    | more `dockerd` arguments (a registry mirror)                                            |
+| `provider.docker.host_socket`     | `/var/run/docker.sock`                  | the engine's socket on its host, for `host-socket`                                      |
+| `provider.docker.user`            | the image's                             | the runner container's user (`uid[:gid]`)                                               |
+| `provider.docker.network`         | the engine's default                    | a network the runner and its Docker join                                                |
+| `provider.docker.labels`          | required                                | per class, label name to runner label                                                   |
+| `provider.docker.config_template` | none                                    | the runner's configuration, with `@@RUNNER_UUID@@`, `@@RUNNER_LABELS@@`                 |
+| `provider.docker.cache_volumes`   | none                                    | per class, a volume mounted at `cache_path`                                             |
+| `provider.docker.cache_path`      | `/var/cache/forgejo-runner`             |                                                                                         |
+| `provider.docker.tls`             | none                                    | `ca_file`, `cert_file`, `key_file`: required for `tcp://` engines                       |
+| `provider.docker.state_dir`       | `slots/` beside the history             | the slots' state, per host                                                              |
+| `provider.docker.idle_hours`      | 24                                      | a ready slot is reset after that                                                        |
+| `provider.docker.job_hours`       | 4                                       | a job is cut after that                                                                 |
+| `provider.docker.boot_timeout`    | 300                                     | seconds for the slot's Docker to answer                                                 |
+| `provider.docker.timeout_seconds` | 20                                      | one API request                                                                         |
+| `provider.incus.tls`              | none                                    | `ca_file` (the server's certificate, pinned, or a CA), `cert_file`, `key_file`          |
+| `provider.incus.project`          | `default`                               | the containers' project                                                                 |
+| `provider.incus.snapshot`         | `clean`                                 | restored before every job                                                               |
+| `provider.incus.config_template`  | required                                | the runner's configuration, on the broker's host                                        |
+| `provider.incus.config_path`      | `/etc/forgejo-runner/config.yml`        | as in a slot file ([examples/slot.yml](examples/slot.yml))                              |
+| `provider.incus.token_path`       | `/etc/forgejo-runner/token`             | as in a slot file                                                                       |
+| `provider.incus.runner_service`   | `forgejo-runner`                        | as in a slot file                                                                       |
+| `provider.incus.runner_user`      | `runner`                                | as in a slot file                                                                       |
+| `provider.incus.work_dir`         | `/var/lib/forgejo-runner/work`          | as in a slot file                                                                       |
+| `provider.incus.cache_pool`       | `default`                               | as in a slot file                                                                       |
+| `provider.incus.labels`           | required                                | as for `docker`                                                                         |
+| `provider.incus.cache_volumes`    | none                                    | per class, an Incus volume attached at `cache_path`                                     |
+| `provider.incus.…`                | as for `docker`                         | `cache_path`, `state_dir`, `idle_hours`, `job_hours`, `boot_timeout`, `timeout_seconds` |
+| `estimate.history_runs`           | 5                                       | the last runs that count                                                                |
+| `estimate.spike_days`             | 30                                      | runs within that many days count too                                                    |
+| `estimate.margin`                 | 1.2                                     | on the job's own peak                                                                   |
+| `estimate.relative_margin`        | 1.5                                     | on a family's or repository's peak                                                      |
+| `estimate.floor_mib`              | 512                                     | the least reserved                                                                      |
+| `estimate.unknown_mib`            | 6144                                    | for a job without history; 0: a host alone                                              |
+| `estimate.retention_days`         | 180                                     | runs older are forgotten                                                                |
+| `cpu.overcommit`                  | 0 (off)                                 | predicted cores within `cpu_cores` times this                                           |
+| `cpu.unknown_cores`               | 1                                       | cores predicted for a job without CPU history                                           |
+| `history.path`                    | `/var/lib/forgejo-berth/history.sqlite` | runs and kept assignments                                                               |
+| `interval_seconds`                | 10                                      | between looks                                                                           |
+| `unused_minutes`                  | 15                                      | a runner without a job is stopped after that                                            |
+| `starve_minutes`                  | 10                                      | a job that fits nowhere then holds a host                                               |
+| `runner_prefix`                   | `berth-`                                | runner names; the sweep deletes only these                                              |
+| `listen`                          | none                                    | address of `/metrics`, `/state`, `/healthz`                                             |
+| `state_file`                      | none                                    | the state document, written after every look                                            |
+| `metrics_file`                    | none                                    | the metrics, written after every look (node_exporter textfile)                          |
+| `shadow`                          | false                                   | compute and log, act on nothing                                                         |
+| `log.format`, `log.level`         | `text`, `info`                          | `json`; `debug`, `warn`, `error`                                                        |
 
 The 6 GiB for an unknown job is enough for a typical container build, while a host of 12 GiB
 or more still runs something beside it. The margins cover a run that needs somewhat more than
 the largest seen; an underestimate is learned at once and counted.
+
+## Docker slots
+
+With the `docker` provider, a host is a Docker Engine: `unix:///path` (the broker's host), or
+`tcp://host:2376` with TLS and a client certificate (`provider.docker.tls`, the key a secret
+file). The slots' reset cycles run in the broker; their state is in `state_dir`, so a restart
+of the broker leaves running jobs alone and takes them up again. For each job, a slot makes:
+
+- `<runner_prefix><host>-<slot>`: the runner's container, from `image`, running
+  `forgejo-runner one-job` for the assigned runner (its token in a file of the container,
+  readable by the runner's user alone). It outlives the runner briefly, so its cgroup can be
+  read after the job;
+- with `job_engine: dind`, `<…>-docker`: a Docker of the slot's own (`dind_image`), whose
+  socket the runner reaches through the volume `<…>-run`. The job's containers run there.
+
+Both, and the volume, are removed before the next job. The job's peak is the sum of both
+containers' `memory.peak` (plus swap), read from their cgroups (cgroup v2; on cgroup v1 the
+stats API's `max_usage`), its CPU use from their `cpu.stat` and `cpu.pressure`.
+
+What a job can reach depends on `job_engine`:
+
+| `job_engine`  | The job's containers run on                       | What the job is given                                       |
+| ------------- | ------------------------------------------------- | ----------------------------------------------------------- |
+| `dind`        | a Docker of the slot's own, removed after the job | a privileged container on the engine; see below             |
+| `none`        | nothing: host-mode labels only (`label:host`)     | the runner's container                                      |
+| `host-socket` | the engine the slots run on                       | **control of that engine**: every container on it, the host |
+
+- `dind` is the default. The slot's Docker runs privileged, as Docker in Docker must; the
+  job's code runs in containers inside it, not in the privileged container itself. A privileged
+  container on a rootful engine is root on the host to whoever escapes it; on a rootless engine
+  (or Podman without root) it is the engine's user. Prefer a rootless engine for jobs you do not
+  trust. Each job's Docker starts empty: images are pulled for every job (a registry mirror
+  in `dind_args` saves that).
+- `host-socket` is an explicit opt-in for trusted jobs only. **A job with the engine's socket
+  can start a privileged container, mount the host's root, read the other slots' tokens and
+  stop the broker's containers: on a rootful engine that is root on the host.** Its containers
+  are siblings of the slots, so their memory is not part of the job's peak, and nothing
+  removes what the job leaves on the engine. The runner's user must be able to use the
+  socket (`user`).
+
+## Incus slots
+
+With the `incus` provider, a host is an Incus server: `https://host:8443` with the broker's
+client certificate (the server's own certificate in `tls.ca_file` is pinned: it must present
+exactly that one), or `unix:///var/lib/incus/unix.socket`. A slot is a container of
+`hosts[].slots`, as with the SSH provider; its reset cycle runs in the broker and does the same
+through the API: stop, restore the snapshot, start, wait for systemd; attach the class's cache
+volume, push the runner's configuration and token through the file API, start the runner;
+watch it with `exec` (its cgroup seen from inside); after the job, the peak from the
+instance's state (`memory.usage_peak` plus `swap_usage_peak`; the container's own
+`memory.peak` where the server reports none), the CPU from its cgroup. The state is in
+`state_dir`, as for Docker. The runner's journal is in the broker's log at debug level.
 
 ## Slot protocol
 
@@ -201,7 +343,15 @@ runner's task line changed).
 
 - The broker holds the admin and owner tokens; a CI host holds none. A runner's token lives in
   the broker only until the slot has it, and on the host until the container's next reset.
-  It is never logged, kept in the history or shown in the state.
+  It is never logged, kept in the history or shown in the state. With the `docker` and
+  `incus` providers the slot side is the broker's: the token waits in `state_dir` (0600) for
+  a few seconds, until the slot's cycle takes it.
+- Docker: see [Docker slots](#docker-slots) for what each `job_engine` grants a job. A remote
+  engine is reached through TLS with a client certificate only.
+- Incus: the broker's certificate is trusted by the servers, which gives it their whole API
+  (restrict it to the slots' project with a restricted certificate,
+  `incus config trust add-certificate --restricted --projects ci`). The server's certificate
+  is pinned.
 - SSH: strict host key checking, batch mode, the configured key only; the host forces one
   command that parses its arguments strictly.
 - Trusted owners' runners are registered at their own user scope: they can only take their
@@ -225,6 +375,8 @@ scripts/dist.sh v0.1.0   # the release archives and checksums.txt in dist/
 `scripts/real-forgejo.sh` runs the broker against a throwaway Forgejo and forgejo-runner in
 Docker (rootless works), with slots that are runner containers: two owners' workflows run, the
 broker learns their peaks and CPU use, and the next build reserves its own peak with the margin.
+`scripts/real-forgejo.sh docker` runs the same through the docker provider, each job's
+containers in a Docker of its slot's own.
 
 ## Licence
 

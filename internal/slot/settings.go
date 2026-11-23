@@ -64,6 +64,9 @@ func (s *Settings) Labels(class string) (map[string]string, bool) {
 	return table, ok && len(table) > 0
 }
 
+// Defaults fills in what the settings leave out, as a settings file's are.
+func (s *Settings) Defaults() { s.defaults() }
+
 func (s *Settings) defaults() {
 	str := func(v *string, d string) {
 		if *v == "" {

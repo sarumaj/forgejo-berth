@@ -4,7 +4,17 @@
 # a Forgejo with an admin, a trusted owner alice and another owner carol, a repository of
 # each with a workflow; slots that are runner containers (e2e/real). Everything is removed
 # afterwards. Images: FORGEJO_IMAGE, RUNNER_IMAGE; the port on 127.0.0.1: PORT.
+#
+#   scripts/real-forgejo.sh          slots played by the test, the runner in host mode
+#   scripts/real-forgejo.sh docker   the docker provider on the same engine (DOCKER_HOST, else
+#                                    /var/run/docker.sock): a Docker of each job's own
 set -eu
+variant=${1:-}
+case "$variant" in
+  "") test=TestRealForgejo ;;
+  docker) test=TestRealForgejoDocker ;;
+  *) echo "usage: $0 [docker]" >&2; exit 2 ;;
+esac
 forgejo_image=${FORGEJO_IMAGE:-codeberg.org/forgejo/forgejo:17}
 runner_image=${RUNNER_IMAGE:-data.forgejo.org/forgejo/runner:13}
 port=${PORT:-13017}
@@ -12,8 +22,10 @@ network=berth-real-$$
 name=berth-forgejo-$$
 work=$(mktemp -d)
 cleanup() {
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  docker ps -aq --filter name=berth-slot- | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
+  docker ps -aq --filter name=berth-slot- | xargs -r docker rm -f -v >/dev/null 2>&1 || true
+  docker ps -aq --filter label=org.forgejo-berth.host=real-e2e | xargs -r docker rm -f -v >/dev/null 2>&1 || true
+  docker volume ls -q --filter label=org.forgejo-berth.host=real-e2e | xargs -r docker volume rm >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   rm -f "$work/admin.token" "$work/alice.token"
   rmdir "$work"
@@ -51,4 +63,5 @@ repo "$work/admin.token" /admin/users/carol/repos site
 BERTH_REAL_URL=$url BERTH_REAL_INNER_URL=http://forgejo:3000 \
   BERTH_REAL_ADMIN_TOKEN_FILE="$work/admin.token" BERTH_REAL_ALICE_TOKEN_FILE="$work/alice.token" \
   BERTH_REAL_RUNNER_IMAGE="$runner_image" BERTH_REAL_NETWORK="$network" \
-  go test -tags realforgejo -run TestRealForgejo -count=1 -timeout 25m -v ./e2e/real/
+  BERTH_REAL_DOCKER_HOST="${DOCKER_HOST:-unix:///var/run/docker.sock}" \
+  go test -tags realforgejo -run "^$test\$" -count=1 -timeout 25m -v ./e2e/real/

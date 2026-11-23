@@ -1,0 +1,72 @@
+# forgejo-berth run --config /etc/forgejo-berth/config.yml, with the incus provider: the slots
+# are Incus containers, reached through the Incus API and restored from a snapshot before
+# every job. The hosts need Incus alone: no forgejo-berth, no SSH account.
+forgejo:
+  url: https://forgejo.example.org
+  admin_token_file: admin.token
+
+trusted:
+  owners:
+    alice: alice.token
+  labels: [ubuntu-latest, docker]
+
+shared:
+  labels: [docker]
+
+hosts:
+  # A server whose API listens on the network (incus config set core.https_address :8443),
+  # with the broker's certificate trusted (incus config trust add-certificate broker.crt).
+  - name: ci-1
+    address: https://ci-1.example.org:8443
+    memory_mib: 14000
+    cpu_cores: 8
+    # The containers: each runs `forgejo-runner one-job` as runner_service, and has the
+    # snapshot below.
+    slots: [ci-a, ci-b]
+  # Incus on the broker's own host, through its socket (the broker's user in incus-admin).
+  - name: local
+    address: unix:///var/lib/incus/unix.socket
+    memory_mib: 6000
+    slots: [ci-c]
+
+provider:
+  type: incus
+  incus:
+    # The server's own certificate (pinned), or the CA that signed it; the broker's client
+    # certificate and its key (a secret: a relative path is in $CREDENTIALS_DIRECTORY).
+    tls:
+      ca_file: /etc/forgejo-berth/incus-server.crt
+      cert_file: /etc/forgejo-berth/broker.crt
+      key_file: broker.key
+    project: default
+    snapshot: clean
+    # The runner's configuration on the broker's host, with @@RUNNER_UUID@@ and
+    # @@RUNNER_LABELS@@ (a JSON list), written to config_path in the container with the
+    # assigned runner's token at token_path.
+    config_template: /etc/forgejo-berth/runner-config.yml
+    config_path: /etc/forgejo-runner/config.yml
+    token_path: /etc/forgejo-runner/token
+    runner_service: forgejo-runner
+    runner_user: runner
+    work_dir: /var/lib/forgejo-runner/work
+    labels:
+      trusted:
+        ubuntu-latest: ubuntu-latest:host
+        docker: docker:docker://node:24-trixie
+      shared:
+        docker: docker:docker://node:24-trixie
+    # Per class, the Incus volume attached at cache_path (optional).
+    cache_volumes:
+      trusted: ci-cache-trusted
+      shared: ci-cache-shared
+    cache_pool: default
+    cache_path: /var/cache/forgejo-runner
+    state_dir: /var/lib/forgejo-berth/slots
+    idle_hours: 24
+    job_hours: 4
+    boot_timeout: 300
+
+history:
+  path: /var/lib/forgejo-berth/history.sqlite
+
+listen: 127.0.0.1:9877

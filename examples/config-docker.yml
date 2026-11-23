@@ -1,0 +1,73 @@
+# forgejo-berth run --config /etc/forgejo-berth/config.yml, with the docker provider: the
+# slots are containers on a Docker Engine (or Podman's Docker API), made for each job and
+# removed after it. Nothing is installed on the engine's host.
+forgejo:
+  url: https://forgejo.example.org
+  # A token of an admin with write:admin and read:repository.
+  admin_token_file: admin.token
+
+trusted:
+  owners:
+    alice: alice.token
+  labels: [ubuntu-latest, docker]
+
+shared:
+  labels: [docker]
+
+hosts:
+  # The broker's own host, through the engine's socket (a rootless engine's is
+  # unix:///run/user/<uid>/docker.sock, Podman's unix:///run/podman/podman.sock).
+  - name: local
+    address: unix:///var/run/docker.sock
+    memory_mib: 6000
+    slots: [a, b]
+  # Another host's engine, through TLS with a client certificate (provider.docker.tls).
+  - name: ci-2
+    address: tcp://ci-2.example.org:2376
+    memory_mib: 14000
+    cpu_cores: 8
+    slots: [a, b, c]
+
+provider:
+  type: docker
+  docker:
+    # The runner's image: sh and forgejo-runner on its PATH.
+    image: data.forgejo.org/forgejo/runner:13
+    # dind: every job gets a Docker of its own beside its runner (a privileged container,
+    # removed after the job); none: no Docker (host-mode labels only); host-socket: the
+    # engine's own socket in the runner, which gives every job control of that engine (read
+    # the README's Security section first).
+    job_engine: dind
+    dind_image: docker.io/library/docker:29-dind
+    # More arguments for the slot's dockerd: a registry mirror saves each job's pulls.
+    dind_args: []
+    # A network the runners and their Docker join (default: the engine's default network).
+    network: ""
+    # Per class, the label names the broker may send and the runner label each becomes.
+    labels:
+      trusted:
+        ubuntu-latest: ubuntu-latest:docker://node:24-trixie
+        docker: docker:docker://node:24-trixie
+      shared:
+        docker: docker:docker://node:24-trixie
+    # Per class, a volume mounted at cache_path in the runner's container (optional).
+    cache_volumes:
+      trusted: berth-cache-trusted
+      shared: berth-cache-shared
+    cache_path: /var/cache/forgejo-runner
+    # The engines' TLS: the CA that signed their certificates, the broker's client
+    # certificate and its key (a secret: a relative path is in $CREDENTIALS_DIRECTORY).
+    tls:
+      ca_file: /etc/forgejo-berth/docker-ca.pem
+      cert_file: /etc/forgejo-berth/docker-cert.pem
+      key_file: docker-key.pem
+    # The slots' state (assignments, the last finished job), per host.
+    state_dir: /var/lib/forgejo-berth/slots
+    idle_hours: 24
+    job_hours: 4
+    boot_timeout: 300
+
+history:
+  path: /var/lib/forgejo-berth/history.sqlite
+
+listen: 127.0.0.1:9877

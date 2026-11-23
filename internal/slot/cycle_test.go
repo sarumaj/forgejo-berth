@@ -457,7 +457,7 @@ func TestAFailedBootSaysWhy(t *testing.T) {
 	s.BootTimeout = 1
 	var calls []string
 	i := NewIncus(s)
-	i.run = scripted(map[string]string{
+	i.instance.(*IncusCommand).run = scripted(map[string]string{
 		"query /1.0/instances/ci/state": `{"status": "Running"}`,
 		"exec ci -- timeout":            "maintenance\n",
 		"exec ci -- systemctl --failed": "docker.service loaded failed failed Docker\nx.mount loaded failed failed X\n",
@@ -486,7 +486,7 @@ func TestApplyWritesTheConfigurationAndToken(t *testing.T) {
 	var calls []string
 	var stdins []string
 	i := NewIncus(s)
-	i.run = func(_ context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
+	i.instance.(*IncusCommand).run = func(_ context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
 		calls = append(calls, strings.Join(args, " "))
 		stdins = append(stdins, string(stdin))
 		return nil, nil, nil
@@ -503,5 +503,21 @@ func TestApplyWritesTheConfigurationAndToken(t *testing.T) {
 	if !slices.Contains(stdins, "uuid: "+testUUID+"\nlabels: [\"docker:docker://node:24-trixie\"]\n") ||
 		!slices.Contains(stdins, testToken) || strings.Contains(joined, testToken) {
 		t.Fatalf("stdins %q", stdins)
+	}
+}
+
+// A job short enough to start and end between two looks is still the runner's job: its
+// runner took a task.
+func TestAJobBetweenTwoLooksIsAJob(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: []look{{true, false}, {false, false}}, took: true, task: 9, peak: 64}
+	c := newCycle(t, dir, sys, sys.clock.stop(100))
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	if !c.Serve(a) {
+		t.Fatal("serve failed")
+	}
+	if last := c.Last(); last.Unused || last.Task != 9 || last.PeakMiB != 64 || last.CPUCores != 0 {
+		t.Fatalf("last %+v", last)
 	}
 }
