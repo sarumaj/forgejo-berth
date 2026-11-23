@@ -132,8 +132,12 @@ func (f *forge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var list []map[string]any
 		for _, j := range f.jobs {
 			if j.RunID == run && page <= 1 {
+				conclusion := ""
+				if j.Status == "success" || j.Status == "failure" || j.Status == "cancelled" {
+					conclusion = j.Status
+				}
 				list = append(list, map[string]any{"id": j.ID, "task_id": j.Task, "status": j.Status,
-					"conclusion": map[bool]string{true: j.Status}[j.Status == "success"]})
+					"conclusion": conclusion})
 			}
 		}
 		reply(map[string]any{"jobs": list})
@@ -175,16 +179,20 @@ func (f *forge) take(runnerUUID string, labels []string) *fakeJob {
 	return nil
 }
 
+// finish ends a running job with success; one cancelled meanwhile stays cancelled.
 func (f *forge) finish(j *fakeJob) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	j.Status = "success"
+	if j.Status == "running" {
+		j.Status = "success"
+	}
 }
 
 // slots is an in-memory provider whose slots go ready, assigned, running, ready.
 type slots struct {
-	mu    sync.Mutex
-	slots map[string]*slotState
+	mu       sync.Mutex
+	slots    map[string]*slotState
+	released []string
 }
 
 type slotState struct {
@@ -193,6 +201,8 @@ type slotState struct {
 	labels []string
 	job    *fakeJob
 	peak   int
+	// releasedFor is the assignment the broker released.
+	releasedFor string
 }
 
 func (s *slots) Status(_ context.Context, h config.Host) ([]provider.Slot, error) {
@@ -221,7 +231,18 @@ func (s *slots) Assign(_ context.Context, h config.Host, container string, ho pr
 	return nil
 }
 
-func (s *slots) Release(context.Context, config.Host, string, string) error { return nil }
+// Release marks the slot's runner released: at the next step, one without a job stops.
+func (s *slots) Release(_ context.Context, h config.Host, container, assignment string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.slots[h.Name+"/"+container]
+	if st == nil || st.Assignment != assignment {
+		return fmt.Errorf("%s does not hold %s", container, assignment)
+	}
+	st.releasedFor = assignment
+	s.released = append(s.released, assignment)
+	return nil
+}
 
 // step lets every assigned runner take its job, and ends the running ones with their peak.
 func (s *slots) step(f *forge, peaks map[string]int) {
@@ -232,6 +253,10 @@ func (s *slots) step(f *forge, peaks map[string]int) {
 		case provider.Assigned:
 			if j := f.take(st.uuid, st.labels); j != nil {
 				st.State, st.job, st.peak = provider.Running, j, peaks[j.Name]
+			} else if st.releasedFor == st.Assignment {
+				// Stopped without a job: unused.
+				st.Slot = provider.Slot{Host: st.Host, Container: st.Container, State: provider.Ready,
+					Finished: st.Assignment, Unused: true}
 			}
 		case provider.Running:
 			f.finish(st.job)
