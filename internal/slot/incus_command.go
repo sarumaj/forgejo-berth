@@ -102,11 +102,19 @@ func (c *IncusCommand) WriteFile(ctx context.Context, path, group string, data [
 	return nil
 }
 
-// SetCache removes the device cache, then adds the volume's.
+// SetCache removes the device cache, then adds the volume's, made when it is not there.
 func (c *IncusCommand) SetCache(ctx context.Context, pool, volume, path string) error {
 	_, _, _ = c.run(ctx, nil, "config", "device", "remove", c.container, "cache")
 	if volume == "" {
 		return nil
+	}
+	if _, _, err := c.run(ctx, nil, "storage", "volume", "show", pool, volume); err != nil {
+		// Another slot's cycle may make the same volume at once: it is there either way.
+		if _, createErr := c.must(ctx, nil, "storage", "volume", "create", pool, volume); createErr != nil {
+			if _, _, err := c.run(ctx, nil, "storage", "volume", "show", pool, volume); err != nil {
+				return createErr
+			}
+		}
 	}
 	_, err := c.must(ctx, nil, "config", "device", "add", c.container, "cache", "disk",
 		"pool="+pool, "source="+volume, "path="+path)

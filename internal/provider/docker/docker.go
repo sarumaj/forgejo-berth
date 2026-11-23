@@ -12,10 +12,11 @@ import (
 	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 )
 
-// Settings are the cycle's settings of a host's slot: its state in <state_dir>/<host>/.
+// Settings are the cycle's settings of a host's slot: its state in <state_dir>/<host>/, its
+// cache volumes' names expanded for it.
 func Settings(s config.Slots, host, name string) *slot.Settings {
 	settings := &slot.Settings{Container: name, StateDir: filepath.Join(s.StateDir, host),
-		LabelTables: s.Labels, ConfigTemplate: s.ConfigTemplate, CacheVolumes: s.CacheVolumes,
+		LabelTables: s.Labels, ConfigTemplate: s.ConfigTemplate, CacheVolumes: slot.ExpandVolumes(s.CacheVolumes, host, name),
 		CachePath: s.CachePath, IdleHours: s.IdleHours, JobHours: s.JobHours, BootTimeout: s.BootTimeout}
 	settings.Defaults()
 	return settings

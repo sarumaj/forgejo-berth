@@ -341,6 +341,16 @@ func (e *Engine) CreateVolume(ctx context.Context, name string, labels map[strin
 	return e.call(ctx, http.MethodPost, "/volumes/create", nil, map[string]any{"Name": name, "Labels": labels}, nil)
 }
 
+// EnsureVolume makes a named volume with the labels unless it exists (a volume's labels are
+// set when it is made, and it is kept as it is).
+func (e *Engine) EnsureVolume(ctx context.Context, name string, labels map[string]string) error {
+	err := e.call(ctx, http.MethodGet, "/volumes/"+url.PathEscape(name), nil, nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	return e.CreateVolume(ctx, name, labels)
+}
+
 // RemoveVolume removes a named volume; one that does not exist is not an error.
 func (e *Engine) RemoveVolume(ctx context.Context, name string) error {
 	err := e.call(ctx, http.MethodDelete, "/volumes/"+url.PathEscape(name), nil, nil, nil)

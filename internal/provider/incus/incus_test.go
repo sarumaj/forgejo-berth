@@ -57,11 +57,15 @@ type fakeIncus struct {
 	badSnap   bool
 	trusted   bool
 	execCount int
+	// volumes are the custom volumes of the pool default; hidden ones are not seen by
+	// the next look at them (another slot makes them meanwhile).
+	volumes, hidden map[string]bool
 }
 
 func newFakeIncus() *fakeIncus {
 	return &fakeIncus{status: "Stopped", files: map[string]string{}, logs: map[string]string{},
 		ops: map[string]map[string]any{}, runner: "active", trusted: true, etag: `"e1"`,
+		volumes: map[string]bool{"cache-shared": true}, hidden: map[string]bool{},
 		devices: map[string]map[string]string{
 			"root":  {"type": "disk", "pool": "default", "path": "/"},
 			"cache": {"type": "disk", "pool": "default", "source": "old", "path": "/var/cache/forgejo-runner"},
@@ -211,6 +215,28 @@ func (f *fakeIncus) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = io.WriteString(w, text)
+	case strings.HasPrefix(r.URL.Path, "/1.0/storage-pools/default/volumes/custom/") && r.Method == http.MethodGet:
+		name := strings.TrimPrefix(r.URL.Path, "/1.0/storage-pools/default/volumes/custom/")
+		if !f.volumes[name] || f.hidden[name] {
+			delete(f.hidden, name)
+			fail(w, 404, "Storage volume not found")
+			return
+		}
+		sync200(w, map[string]any{"name": name, "type": "custom", "content_type": "filesystem"})
+	case r.URL.Path == "/1.0/storage-pools/default/volumes" && r.Method == http.MethodPost:
+		var body struct {
+			Name        string `json:"name"`
+			Type        string `json:"type"`
+			ContentType string `json:"content_type"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.calls = append(f.calls, fmt.Sprintf("volume create %s %s %s", body.Name, body.Type, body.ContentType))
+		if f.volumes[body.Name] || body.Type != "custom" {
+			fail(w, 409, "Volume by that name already exists")
+			return
+		}
+		f.volumes[body.Name] = true
+		sync200(w, map[string]any{})
 	case r.URL.Path == "/1.0/instances/ci/logs/lxc.log":
 		_, _ = io.WriteString(w, "lxc ci: started\nlxc ci: last line\n")
 	case r.URL.Path == "/1.0/instances/ci/files" && r.Method == http.MethodPost:
@@ -514,4 +540,54 @@ provider:
 		t.Fatalf("ci-1 with the provider's: %v", err)
 	}
 	hosted.Stop()
+}
+
+// A slot's own cache volume ({host}, {slot}) is made in the pool at its first use, and
+// attached as it is afterwards.
+func TestASlotsOwnCacheVolumeIsMade(t *testing.T) {
+	f := newFakeIncus()
+	f.status = "Running"
+	client, _, _ := serveTLS(t, f)
+	s := testSettings(t)
+	cfg := config.Incus{}
+	cfg.CacheVolumes = map[string]string{"shared": "cache-{host}-{slot}"}
+	s.CacheVolumes = slot.ExpandVolumes(cfg.CacheVolumes, "ci-1", "ci")
+	system := slot.NewIncusOn(s, NewInstance(client, "ci", 5*time.Second))
+	a := provider.Parsed{ID: "ci-1-ci-7-42", UUID: testUUID, Token: testToken, Class: "shared",
+		Labels: []string{"docker:docker://node:24"}, UnusedMinutes: 15}
+	for range 2 {
+		if err := system.Apply(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.devices["cache"]["source"] != "cache-ci-1-ci" || !f.volumes["cache-ci-1-ci"] {
+		t.Fatalf("devices %v volumes %v", f.devices, f.volumes)
+	}
+	var made []string
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "volume create") {
+			made = append(made, c)
+		}
+	}
+	if !slices.Equal(made, []string{"volume create cache-ci-1-ci custom filesystem"}) {
+		t.Fatalf("made %v", made)
+	}
+	// Made by another slot in between: the conflict is no failure.
+	f.mu.Lock()
+	f.volumes["raced"], f.hidden["raced"] = true, true
+	f.mu.Unlock()
+	instance := NewInstance(client, "ci", 5*time.Second)
+	if err := instance.ensureVolume(t.Context(), "default", "raced"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(f.calls, "volume create raced custom filesystem") {
+		t.Fatal("the race was not run")
+	}
+	// A volume that cannot be made fails the attachment.
+	f.mu.Lock()
+	f.volumes = map[string]bool{}
+	f.mu.Unlock()
+	if err := instance.SetCache(t.Context(), "other-pool", "x", "/cache"); err == nil {
+		t.Fatal("a volume of a pool that is not there was attached")
+	}
 }

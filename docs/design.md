@@ -280,6 +280,23 @@ step in progress and leaves the container as it is (`stopped`).
 The state goes to `<state_dir>/<container>.json`; the assignment to `<container>.assignment`,
 the release to `<container>.release`.
 
+### Cache volumes
+
+A class's cache volume (`cache_volumes`) is attached to the slot for every job of that class
+and kept over the reset. A name with `{host}` and `{slot}` is expanded per slot (the slot side
+expands it, on the host for the SSH provider with the host's short name), so that each slot has
+a volume of its own: two jobs at once never write the same cache, and a slot's next job finds
+what the last one left. A plain name stays one volume for all slots, as before.
+
+A volume that is not there is made at the first use, rather than refused: with one volume per
+slot and class, making them all by hand is the error-prone step, and an empty cache volume is
+what a new one would be anyway. Docker: `GET /volumes/<name>`, else `POST /volumes/create` with
+the labels `org.forgejo-berth.host` and `org.forgejo-berth.cache` (a volume the mount made
+would have none). Incus: `GET /1.0/storage-pools/<pool>/volumes/custom/<name>`, else a `POST`
+of a custom file system volume in `cache_pool` (the `incus` command: `storage volume show`,
+`create`); two cycles that make the same volume at once both go on. berth removes no cache
+volume.
+
 ## Docker provider
 
 A host's `address` is its engine: `unix:///path`, or `tcp://host:port` with TLS

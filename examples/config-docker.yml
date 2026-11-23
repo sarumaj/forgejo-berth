@@ -50,10 +50,12 @@ provider:
         docker: docker:docker://node:24-trixie
       shared:
         docker: docker:docker://node:24-trixie
-    # Per class, a volume mounted at cache_path in the runner's container (optional).
+    # Per class, a volume mounted at cache_path in the runner's container (optional), made
+    # when it is not there. {host} and {slot} give each slot a volume of its own; a plain
+    # name is one volume that all of a host's slots use at once.
     cache_volumes:
-      trusted: berth-cache-trusted
-      shared: berth-cache-shared
+      trusted: berth-cache-{host}-{slot}-trusted
+      shared: berth-cache-{host}-{slot}-shared
     cache_path: /var/cache/forgejo-runner
     # The engines' TLS: the CA that signed their certificates, the broker's client
     # certificate and its key (a secret: a relative path is in $CREDENTIALS_DIRECTORY).

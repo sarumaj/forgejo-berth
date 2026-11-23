@@ -166,8 +166,14 @@ func (i *Instance) WriteFile(ctx context.Context, path, group string, data []byt
 }
 
 // SetCache replaces the device cache: the instance is read and put back (If-Match: a
-// change in between fails the put) with its devices changed.
+// change in between fails the put) with its devices changed. A volume that is not in the
+// pool is made first.
 func (i *Instance) SetCache(ctx context.Context, pool, volume, path string) error {
+	if volume != "" {
+		if err := i.ensureVolume(ctx, pool, volume); err != nil {
+			return err
+		}
+	}
 	var current map[string]json.RawMessage
 	header, err := i.client.get(ctx, i.path(""), &current)
 	if err != nil {
@@ -202,6 +208,26 @@ func (i *Instance) SetCache(ctx context.Context, pool, volume, path string) erro
 	}
 	_, err = i.client.do(ctx, http.MethodPut, i.path(""), put, ifMatch)
 	return err
+}
+
+// ensureVolume makes the custom volume (a file system) in the pool unless it is there.
+// Another slot's cycle may make it at the same moment: it is there either way.
+func (i *Instance) ensureVolume(ctx context.Context, pool, volume string) error {
+	path := "/1.0/storage-pools/" + url.PathEscape(pool) + "/volumes/custom/" + url.PathEscape(volume)
+	var found map[string]any
+	_, err := i.client.get(ctx, path, &found)
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	_, err = i.client.do(ctx, http.MethodPost, "/1.0/storage-pools/"+url.PathEscape(pool)+"/volumes",
+		map[string]any{"name": volume, "type": "custom", "content_type": "filesystem"}, nil)
+	if err != nil {
+		if _, again := i.client.get(ctx, path, &found); again == nil {
+			return nil
+		}
+		return fmt.Errorf("the cache volume %s: %w", volume, err)
+	}
+	return nil
 }
 
 // Log returns the container's LXC log.

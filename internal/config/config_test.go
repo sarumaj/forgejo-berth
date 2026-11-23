@@ -261,3 +261,29 @@ func TestAHostsTLSForADockerEngine(t *testing.T) {
 		t.Fatalf("TLS %+v", got)
 	}
 }
+
+func TestCacheVolumesOfEachSlot(t *testing.T) {
+	c, err := Parse([]byte(dockerHosts + `provider:
+  type: docker
+  docker:
+    labels: {shared: {docker: d}}
+    cache_volumes: {shared: "cache-{host}-{slot}", trusted: cache-trusted}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ExpandVolume(c.Provider.Docker.CacheVolumes["shared"], "local", "b"); got != "cache-local-b" {
+		t.Fatalf("expanded %q", got)
+	}
+	for _, tc := range []struct{ volume, want string }{
+		{"cache-{class}", "placeholders"},
+		{"cache {slot}", "letters, digits"},
+		{"{slot}/x", "letters, digits"},
+	} {
+		_, err := Parse([]byte(dockerHosts + "provider: {type: docker, docker: {labels: {shared: {docker: d}}, " +
+			"cache_volumes: {shared: \"" + tc.volume + "\"}}}\n"))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want one about %s", tc.volume, err, tc.want)
+		}
+	}
+}

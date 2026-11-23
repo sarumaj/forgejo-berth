@@ -21,6 +21,28 @@ import (
 // and of a runner's name, which the slot side checks with the same pattern.
 var Name = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
+// volumeName is what a cache volume's name must look like once its placeholders are
+// expanded: a name both Docker and Incus take.
+var volumeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+
+// ExpandVolume returns the name of a slot's cache volume: {host} is the host's name, {slot}
+// the slot's (an Incus slot's container), so that each slot can have a cache of its own.
+func ExpandVolume(name, host, slot string) string {
+	return strings.NewReplacer("{host}", host, "{slot}", slot).Replace(name)
+}
+
+// CheckVolume tells whether an expanded cache volume name is one: a placeholder left over is
+// not known.
+func CheckVolume(name string) error {
+	if strings.ContainsAny(name, "{}") {
+		return fmt.Errorf("cache volume %q: the placeholders are {host} and {slot}", name)
+	}
+	if !volumeName.MatchString(name) {
+		return fmt.Errorf("cache volume %q: letters, digits, '_', '.' and '-'", name)
+	}
+	return nil
+}
+
 // ownerName is a Forgejo user name.
 var ownerName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
@@ -198,7 +220,9 @@ type Slots struct {
 	// ConfigTemplate is the runner's configuration, with @@RUNNER_UUID@@ and
 	// @@RUNNER_LABELS@@, on the broker's host.
 	ConfigTemplate string `yaml:"config_template"`
-	// CacheVolumes maps a class to a volume mounted at CachePath (none: no cache).
+	// CacheVolumes maps a class to a volume mounted at CachePath (none: no cache). {host}
+	// and {slot} in a name are the slot's, for a volume of each slot's own; a volume that
+	// does not exist is made at its first use.
 	CacheVolumes map[string]string `yaml:"cache_volumes"`
 	CachePath    string            `yaml:"cache_path"`
 	IdleHours    float64           `yaml:"idle_hours"`
@@ -538,9 +562,23 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 			fail("%s.labels names no class (nor hosts[%d].labels)", where, i)
 		}
 	}
-	for class := range slots.CacheVolumes {
+	for class, volume := range slots.CacheVolumes {
 		if class != "trusted" && class != "shared" {
 			fail("%s.cache_volumes: the classes are trusted and shared, not %q", where, class)
+		}
+		if volume == "" {
+			continue
+		}
+		problem := CheckVolume(ExpandVolume(volume, "host", "slot"))
+		for _, h := range c.Hosts {
+			for _, s := range h.Slots {
+				if problem == nil {
+					problem = CheckVolume(ExpandVolume(volume, h.Name, s))
+				}
+			}
+		}
+		if problem != nil {
+			fail("%s.cache_volumes.%s: %v", where, class, problem)
 		}
 	}
 	if !filepath.IsAbs(slots.CachePath) {

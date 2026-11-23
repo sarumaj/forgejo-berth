@@ -201,7 +201,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.docker.network`         | the engine's default                    | a network the runner and its Docker join                                                |
 | `provider.docker.labels`          | required                                | per class, label name to runner label                                                   |
 | `provider.docker.config_template` | none                                    | the runner's configuration, with `@@RUNNER_UUID@@`, `@@RUNNER_LABELS@@`                 |
-| `provider.docker.cache_volumes`   | none                                    | per class, a volume mounted at `cache_path`                                             |
+| `provider.docker.cache_volumes`   | none                                    | per class, a volume at `cache_path`; `{host}`, `{slot}`: [each slot's](#cache-volumes)  |
 | `provider.docker.cache_path`      | `/var/cache/forgejo-runner`             |                                                                                         |
 | `provider.docker.tls`             | none                                    | `ca_file`, `cert_file`, `key_file`: required for `tcp://` engines                       |
 | `provider.docker.state_dir`       | `slots/` beside the history             | the slots' state, per host                                                              |
@@ -220,7 +220,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.incus.work_dir`         | `/var/lib/forgejo-runner/work`          | as in a slot file                                                                       |
 | `provider.incus.cache_pool`       | `default`                               | as in a slot file                                                                       |
 | `provider.incus.labels`           | required                                | as for `docker`                                                                         |
-| `provider.incus.cache_volumes`    | none                                    | per class, an Incus volume attached at `cache_path`                                     |
+| `provider.incus.cache_volumes`    | none                                    | per class, an Incus volume at `cache_path`; as for `docker`                             |
 | `provider.incus.…`                | as for `docker`                         | `cache_path`, `state_dir`, `idle_hours`, `job_hours`, `boot_timeout`, `timeout_seconds` |
 | `estimate.history_runs`           | 5                                       | the last runs that count                                                                |
 | `estimate.spike_days`             | 30                                      | runs within that many days count too                                                    |
@@ -299,6 +299,27 @@ seen from inside); after the job, the peak from the instance's state (`memory.us
 `swap_usage_peak`; the container's own `memory.peak` where the server reports none), the CPU
 from its cgroup. The state is in `state_dir`, as for Docker. The runner's journal is in the
 broker's log at debug level.
+
+## Cache volumes
+
+`cache_volumes` gives the runner a volume at `cache_path` that outlives the slot's reset, per
+class (`trusted`, `shared`): the runner's caches (its `actions/cache` server's store, set in its
+configuration) then last from one job to the next. A plain name is one volume for every slot of
+a host, which their jobs use at the same time. With `{slot}` (and `{host}`) in the name, each
+slot has a volume of its own:
+
+```yaml
+cache_volumes:
+  trusted: berth-cache-{host}-{slot}-trusted
+  shared: berth-cache-{host}-{slot}-shared
+```
+
+`{host}` is the host's name, `{slot}` the slot's (an Incus slot's container); in an SSH host's
+slot file, `{slot}` is the container and `{host}` the host's own short name. A volume that is not
+there is made at its first use, empty: a Docker named volume (with the labels
+`org.forgejo-berth.host` and `org.forgejo-berth.cache`, its class), or an Incus custom volume
+in `cache_pool`. berth never removes one: a slot taken out of the configuration leaves its
+volume behind, for `docker volume rm` or `incus storage volume delete`.
 
 ## Slot protocol
 

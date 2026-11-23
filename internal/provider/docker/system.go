@@ -32,11 +32,13 @@ const (
 	hostSocket = "/var/run/docker.sock"
 )
 
-// Labels on the provider's containers and volumes.
+// Labels on the provider's containers and volumes; a cache volume the provider made has the
+// host's and the class's.
 const (
 	LabelHost       = "org.forgejo-berth.host"
 	LabelSlot       = "org.forgejo-berth.slot"
 	LabelAssignment = "org.forgejo-berth.assignment"
+	LabelCache      = "org.forgejo-berth.cache"
 )
 
 // wrapper runs the runner ("$@") and outlives it: the container stays up after the job, so
@@ -140,6 +142,10 @@ func (d *System) Apply(a provider.Parsed) error {
 		spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, Mount{Type: "bind", Source: d.cfg.HostSocket, Target: hostSocket})
 	}
 	if volume := d.settings.CacheVolumes[a.Class]; volume != "" {
+		// Made here rather than by the mount, so that it carries the provider's labels.
+		if err := d.engine.EnsureVolume(ctx, volume, map[string]string{LabelHost: d.host, LabelCache: a.Class}); err != nil {
+			return err
+		}
 		spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, Mount{Type: "volume", Source: volume, Target: d.cfg.CachePath})
 	}
 	if err := d.engine.Create(ctx, d.name, spec); err != nil {

@@ -50,7 +50,8 @@ type Instance interface {
 	// never reads half of it.
 	WriteFile(ctx context.Context, path, group string, data []byte) error
 	// SetCache removes the container's device "cache" and, for a volume, attaches that
-	// volume of the pool at path.
+	// volume of the pool at path; a custom volume of that name is made in the pool when
+	// there is none.
 	SetCache(ctx context.Context, pool, volume, path string) error
 	// Log returns the container's own log (LXC's and its console's).
 	Log(ctx context.Context) (string, error)

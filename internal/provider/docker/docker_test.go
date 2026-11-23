@@ -45,15 +45,18 @@ type fakeEngine struct {
 	mu         sync.Mutex
 	containers map[string]*container
 	volumes    map[string]bool
-	images     map[string]bool
-	calls      []string
-	execs      map[string][]string
-	pullError  string
+	// volumeLabels are each volume's labels, as it was made.
+	volumeLabels map[string]map[string]string
+	images       map[string]bool
+	calls        []string
+	execs        map[string][]string
+	pullError    string
 }
 
 func newFakeEngine() *fakeEngine {
 	return &fakeEngine{containers: map[string]*container{}, volumes: map[string]bool{},
-		images: map[string]bool{}, execs: map[string][]string{}}
+		volumeLabels: map[string]map[string]string{},
+		images:       map[string]bool{}, execs: map[string][]string{}}
 }
 
 // frame is one frame of a multiplexed stream.
@@ -178,12 +181,20 @@ func (f *fakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(append(frame(1, out), frame(2, "a warning\n")...))
 	case r.URL.Path == "/volumes/create":
 		var body struct {
-			Name string `json:"Name"`
+			Name   string            `json:"Name"`
+			Labels map[string]string `json:"Labels"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.volumes[body.Name] = true
+		f.volumeLabels[body.Name] = body.Labels
 		w.WriteHeader(http.StatusCreated)
 		reply(map[string]string{"Name": body.Name})
+	case parts[0] == "volumes" && len(parts) == 2 && r.Method == http.MethodGet:
+		if !f.volumes[parts[1]] {
+			notFound()
+			return
+		}
+		reply(map[string]any{"Name": parts[1], "Labels": f.volumeLabels[parts[1]]})
 	case parts[0] == "volumes" && r.Method == http.MethodDelete:
 		if !f.volumes[parts[1]] {
 			notFound()
@@ -222,7 +233,7 @@ provider:
     labels:
       trusted: {ubuntu-latest: "ubuntu-latest:docker://node:24"}
       shared: {docker: "docker:docker://node:24"}
-    cache_volumes: {shared: cache-shared}
+    cache_volumes: {shared: "cache-{host}-{slot}"}
     dind_args: [--registry-mirror=https://mirror.example.org]
 `))
 	if err != nil {
@@ -310,8 +321,25 @@ func TestASlotsLifeOnTheEngine(t *testing.T) {
 	if task, peak := d.Measure(); task != 8480 || peak != 6 {
 		t.Fatalf("measured %d %d", task, peak)
 	}
-	if err := d.Reset(); err != nil || len(f.containers) != 0 || len(f.volumes) != 0 {
+	// The slot's cache volume is its own, labelled, and outlives the reset; nothing else does.
+	if err := d.Reset(); err != nil || len(f.containers) != 0 || len(f.volumes) != 1 || !f.volumes["cache-ci-1-a"] {
 		t.Fatalf("after the reset %v %v (%v)", f.containers, f.volumes, err)
+	}
+	if l := f.volumeLabels["cache-ci-1-a"]; l[LabelHost] != "ci-1" || l[LabelCache] != "shared" {
+		t.Fatalf("the cache volume's labels %v", l)
+	}
+	if err := d.Apply(a); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(strings.Join(f.calls, ","), "POST /volumes/create"); n != 3 {
+		t.Fatalf("volumes made %d times (the run volume twice, the cache once): %v", n, f.calls)
+	}
+	var mounted bool
+	for _, m := range f.containers["berth-ci-1-a"].spec.HostConfig.Mounts {
+		mounted = mounted || m.Source == "cache-ci-1-a" && m.Target == "/var/cache/forgejo-runner"
+	}
+	if !mounted {
+		t.Fatalf("the cache is not mounted: %+v", f.containers["berth-ci-1-a"].spec.HostConfig.Mounts)
 	}
 }
 
