@@ -16,7 +16,9 @@ a fixed host, admitted by the job's learned memory peak. One Go binary: `run` (t
 - `internal/forgejo/`: the Forgejo API client.
 - `internal/provider/`: the slot provider interface, the SSH provider, the protocol's checks.
 - `internal/slot/`: the host side: the slot command, the reset cycle, Incus.
-- `e2e/`: the broker against a fake Forgejo API and an in-memory provider.
+- `e2e/`: the broker against a fake Forgejo API and an in-memory provider; `e2e/real/` (build
+  tag `realforgejo`, run by `scripts/real-forgejo.sh`) against a real Forgejo and runner in
+  Docker.
 - `examples/`: configuration, slot settings, units. `scripts/`: the release build.
 
 ## Rules

@@ -222,6 +222,10 @@ CGO_ENABLED=0 go build -trimpath -o forgejo-berth ./cmd/forgejo-berth
 scripts/dist.sh v0.1.0   # the release archives and checksums.txt in dist/
 ```
 
+`scripts/real-forgejo.sh` runs the broker against a throwaway Forgejo and forgejo-runner in
+Docker (rootless works), with slots that are runner containers: two owners' workflows run, the
+broker learns their peaks and CPU use, and the next build reserves its own peak with the margin.
+
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
