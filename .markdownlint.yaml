@@ -5,3 +5,7 @@ MD013:
   code_blocks: false
 MD060:
   style: aligned
+# The changelog repeats its kinds of change (### Added) under every version: the same heading
+# is allowed, but not twice under one parent.
+MD024:
+  siblings_only: true
