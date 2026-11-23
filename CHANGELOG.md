@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The release bot
 writes each version's section from the commits (Conventional Commits) and the hand-written
 Unreleased section.
 
+## 0.2.1 - 2026-11-23
+
+### Fixed
+
+- a global runner may take any owner's job, and a new runner reserves for claimed ones
+
 ## 0.2.0 - 2026-11-23
 
 ### Added
