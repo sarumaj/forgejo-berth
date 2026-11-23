@@ -457,7 +457,7 @@ func TestAFailedBootSaysWhy(t *testing.T) {
 	s.BootTimeout = 1
 	var calls []string
 	i := NewIncus(s)
-	i.run = scripted(map[string]string{
+	i.instance.(*IncusCommand).run = scripted(map[string]string{
 		"query /1.0/instances/ci/state": `{"status": "Running"}`,
 		"exec ci -- timeout":            "maintenance\n",
 		"exec ci -- systemctl --failed": "docker.service loaded failed failed Docker\nx.mount loaded failed failed X\n",
@@ -486,7 +486,7 @@ func TestApplyWritesTheConfigurationAndToken(t *testing.T) {
 	var calls []string
 	var stdins []string
 	i := NewIncus(s)
-	i.run = func(_ context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
+	i.instance.(*IncusCommand).run = func(_ context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
 		calls = append(calls, strings.Join(args, " "))
 		stdins = append(stdins, string(stdin))
 		return nil, nil, nil

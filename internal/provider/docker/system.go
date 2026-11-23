@@ -54,12 +54,6 @@ trap - TERM INT
 while :; do sleep 3600; done
 `
 
-// cgroupScript prints the container's own cgroup files the cycle reads, each after a line
-// "@<name>" (a missing one is empty): cgroup v2 with a cgroup namespace shows a container its
-// own cgroup at /sys/fs/cgroup.
-const cgroupScript = `cd /sys/fs/cgroup 2>/dev/null || exit 0
-for f in memory.peak memory.swap.peak cpu.stat cpu.pressure; do echo "@$f"; cat "$f" 2>/dev/null; done`
-
 // System is one slot of an engine: the runner's container <name>, made for each assignment,
 // and with the dind engine the slot's own Docker <name>-docker beside it, sharing the volume
 // <name>-run, where that Docker's socket is. Reset removes them all.
@@ -350,34 +344,12 @@ func (d *System) containers() []string {
 }
 
 // cgroup reads a container's own cgroup files.
-func (d *System) cgroup(ctx context.Context, name string) (map[string]string, error) {
-	out, code, err := d.engine.Exec(ctx, name, "sh", "-c", cgroupScript)
+func (d *System) cgroup(ctx context.Context, name string) (slot.CgroupReader, error) {
+	out, code, err := d.engine.Exec(ctx, name, "sh", "-c", slot.CgroupScript)
 	if err == nil && code != 0 {
 		err = fmt.Errorf("reading the cgroup of %s exited %d", name, code)
 	}
-	files := map[string]string{}
-	current := ""
-	for _, line := range strings.SplitAfter(out, "\n") {
-		if name, ok := strings.CutPrefix(strings.TrimRight(line, "\n"), "@"); ok && !strings.Contains(name, " ") {
-			current = name
-			files[current] = ""
-			continue
-		}
-		if current != "" {
-			files[current] += line
-		}
-	}
-	return files, err
-}
-
-func reader(files map[string]string) slot.CgroupReader {
-	return func(name string) ([]byte, error) {
-		text, ok := files[name]
-		if !ok || strings.TrimSpace(text) == "" {
-			return nil, os.ErrNotExist
-		}
-		return []byte(text), nil
-	}
+	return slot.CgroupDump(out), err
 }
 
 // Measure returns the task from the runner's log, and the most memory the slot's containers
@@ -389,7 +361,7 @@ func (d *System) Measure() (int64, int) {
 	var peak int64
 	for _, name := range d.containers() {
 		files, err := d.cgroup(ctx, name)
-		bytes := slot.CgroupPeak(reader(files))
+		bytes := slot.CgroupPeak(files)
 		if bytes == 0 {
 			bytes, _ = d.engine.MaxUsage(ctx, name)
 		}
@@ -411,7 +383,7 @@ func (d *System) CPU() (int64, int64, bool) {
 		if err != nil {
 			return 0, 0, false
 		}
-		u, p, ok := slot.CgroupCPU(reader(files))
+		u, p, ok := slot.CgroupCPU(files)
 		if !ok {
 			return 0, 0, false
 		}
