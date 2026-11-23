@@ -1,0 +1,18 @@
+# One slot's reset cycle on a CI host, as root (it restores and starts the container).
+# A stop signals the cycle alone, which ends the step in progress first.
+[Unit]
+Description=forgejo-berth: reset the slot %i around every job
+After=incus.service
+Wants=incus.service
+
+[Service]
+ExecStart=/usr/local/bin/forgejo-berth cycle %i
+RuntimeDirectory=forgejo-berth
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=30
+KillMode=mixed
+TimeoutStopSec=20min
+
+[Install]
+WantedBy=multi-user.target

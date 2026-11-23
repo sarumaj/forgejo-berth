@@ -1,0 +1,3 @@
+# /etc/sudoers.d/forgejo-berth on a CI host: the broker's account runs the slot command as
+# root, which parses its one argument itself.
+berth ALL=(root) NOPASSWD: /usr/local/bin/forgejo-berth slot *

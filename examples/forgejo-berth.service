@@ -1,0 +1,23 @@
+# The broker, on a host that reaches Forgejo and the CI hosts.
+[Unit]
+Description=forgejo-berth: an ephemeral runner for each waiting job, where it fits
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/forgejo-berth run --config /etc/forgejo-berth/config.yml
+User=forgejo-berth
+StateDirectory=forgejo-berth
+RuntimeDirectory=forgejo-berth
+LoadCredential=admin.token:/etc/forgejo-berth/admin.token
+LoadCredential=alice.token:/etc/forgejo-berth/alice.token
+LoadCredential=ssh_key:/etc/forgejo-berth/ssh_key
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
