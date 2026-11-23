@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
 )
 
 // State is what the broker publishes after every look (the /state endpoint, state_file).
@@ -24,6 +26,9 @@ type State struct {
 	Counts      map[string]int       `json:"counts"`
 	Estimates   map[string]int       `json:"estimates"`
 	JobsLearned int                  `json:"jobs_learned"`
+	// Cycles are the slots' reset cycles the broker runs itself (the docker and incus
+	// providers); an SSH host's cycles write their own metrics on the host.
+	Cycles []provider.CycleStats `json:"cycles,omitempty"`
 }
 
 // HostState is a host's part of the state.
@@ -64,6 +69,9 @@ func (b *Broker) publish(now float64, waiting, unservable int, sources map[strin
 	}
 	for _, src := range estimateSources {
 		s.Estimates[src] = sources[src]
+	}
+	if r, ok := b.slots.(provider.CycleReporter); ok {
+		s.Cycles = r.Cycles()
 	}
 	for _, h := range b.cfg.Hosts {
 		s.Hosts[h.Name] = HostState{Reachable: b.reachable[h.Name]}
@@ -128,6 +136,7 @@ func (s State) Metrics() string {
 	}
 	metric("jobs_learned", "gauge", "Jobs with a memory history.")
 	fmt.Fprintf(&w, "forgejo_berth_jobs_learned %d\n", s.JobsLearned)
+	w.WriteString(provider.CycleMetrics(s.Cycles))
 	return w.String()
 }
 

@@ -109,6 +109,10 @@ func TestLocalServesTheSlotCommandInProcess(t *testing.T) {
 		return nil
 	}
 	wait(provider.Ready)
+	if cycles := h.Cycles(); len(cycles) != 1 || cycles[0].Host != "ci-1" || cycles[0].Container != "ci" ||
+		cycles[0].State != provider.Ready {
+		t.Fatalf("cycles %+v", cycles)
+	}
 	handoff := provider.Handoff{Assignment: "ci-1-ci-1-7", UUID: testUUID, Token: testToken,
 		Labels: []string{"ubuntu-latest"}, Class: "trusted", UnusedMinutes: 15}
 	if err := h.Assign(context.Background(), host, "ci", handoff); err != nil {
@@ -130,6 +134,15 @@ func TestLocalServesTheSlotCommandInProcess(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(dir, "state/ci.json"))
 	if strings.Contains(string(data), testToken) {
 		t.Fatal("the token is in the state")
+	}
+	for i := 0; h.Cycles()[0].Failures != 1; i++ {
+		if i == 500 {
+			t.Fatalf("a runner that failed to start is not a failure: %+v", h.Cycles())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if (&Local{slots: l.slots}).Cycles("ci-1") != nil {
+		t.Fatal("cycles not started are reported")
 	}
 	if _, err := h.Status(context.Background(), config.Host{Name: "ci-2"}); err == nil {
 		t.Fatal("an unknown host answered")

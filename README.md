@@ -358,10 +358,14 @@ runner never gets a trusted label, whatever it is sent. Every field's check is i
   `forgejo_berth_host_reachable{host}`, `forgejo_berth_reserved_mib{host}`,
   `forgejo_berth_events_total{event}` (`assigned`, `learned`, `unlearned`, `unused`, `failed`,
   `underestimated`, `released`, `would_assign`), `forgejo_berth_estimates{source}`,
-  `forgejo_berth_jobs_learned`, `forgejo_berth_shadow`. The cycle writes
-  `forgejo_berth_cycle_*` to a node_exporter textfile directory when one is set.
+  `forgejo_berth_jobs_learned`, `forgejo_berth_shadow`. Each slot's reset cycle has
+  `forgejo_berth_cycle_state{container,state}`, `forgejo_berth_cycle_jobs_total{container}`,
+  `forgejo_berth_cycle_failures{container}` and `forgejo_berth_cycle_last_reset_seconds{container}`:
+  on an SSH host the cycle writes them to a node_exporter textfile directory when one is set
+  (`textfile_dir`); with the `docker` and `incus` providers they are part of the broker's
+  metrics (and `metrics_file`), with a `host` label.
 - `GET /state`: the hosts' reachability and reservations, the assignments (no tokens), the
-  counters and the estimates' sources.
+  counters and the estimates' sources, and the cycles the broker runs (`cycles`).
 - `GET /healthz`: 200 while the last look is recent.
 - Logs: structured (`log/slog`), one line per decision.
 

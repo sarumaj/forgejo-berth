@@ -437,23 +437,10 @@ func (c *Cycle) write() {
 	if st, err := os.Stat(s.TextfileDir); err != nil || !st.IsDir() {
 		return
 	}
-	label := fmt.Sprintf("container=%q", s.Container)
-	var b strings.Builder
-	b.WriteString("# HELP forgejo_berth_cycle_state The slot's state in its reset cycle (1: the current one).\n")
-	b.WriteString("# TYPE forgejo_berth_cycle_state gauge\n")
-	for _, each := range []string{provider.Resetting, provider.Ready, provider.Assigned, provider.Running,
-		provider.Failed, provider.Stopped} {
-		fmt.Fprintf(&b, "forgejo_berth_cycle_state{%s,state=%q} %d\n", label, each, btoi(each == c.state))
-	}
-	fmt.Fprintf(&b, "# HELP forgejo_berth_cycle_jobs_total Jobs the slot ran since the cycle started.\n"+
-		"# TYPE forgejo_berth_cycle_jobs_total counter\nforgejo_berth_cycle_jobs_total{%s} %d\n", label, c.jobs)
-	fmt.Fprintf(&b, "# HELP forgejo_berth_cycle_failures Resets or runner starts that failed in a row.\n"+
-		"# TYPE forgejo_berth_cycle_failures gauge\nforgejo_berth_cycle_failures{%s} %d\n", label, c.failures)
-	fmt.Fprintf(&b, "# HELP forgejo_berth_cycle_last_reset_seconds How long the last reset took.\n"+
-		"# TYPE forgejo_berth_cycle_last_reset_seconds gauge\nforgejo_berth_cycle_last_reset_seconds{%s} %.1f\n",
-		label, c.lastResetSeconds)
+	metrics := provider.CycleMetrics([]provider.CycleStats{{Container: s.Container, State: c.state,
+		Jobs: c.jobs, Failures: c.failures, LastResetSeconds: c.lastResetSeconds}})
 	name := "forgejo_berth_cycle_" + strings.ReplaceAll(s.Container, "-", "_") + ".prom"
-	if err := replace(filepath.Join(s.TextfileDir, name), []byte(b.String())); err != nil {
+	if err := replace(filepath.Join(s.TextfileDir, name), []byte(metrics)); err != nil {
 		c.log.Error("the metrics were not written", "error", err)
 	}
 }
@@ -467,13 +454,6 @@ func unix(t time.Time) int64 {
 		return 0
 	}
 	return t.Unix()
-}
-
-func btoi(v bool) int {
-	if v {
-		return 1
-	}
-	return 0
 }
 
 // replace writes a file at once: readers never see half of it.

@@ -589,8 +589,24 @@ starts there until the job fits.
 
   Events: `assigned`, `learned`, `unlearned`, `unused`, `failed`, `underestimated`, `released`,
   and in shadow mode `would_assign`.
+- The reset cycles' metrics, one series per slot:
+
+  | Metric                                   | Labels                         | Kind    |
+  | ---------------------------------------- | ------------------------------ | ------- |
+  | `forgejo_berth_cycle_state`              | (`host`), `container`, `state` | gauge   |
+  | `forgejo_berth_cycle_jobs_total`         | (`host`), `container`          | counter |
+  | `forgejo_berth_cycle_failures`           | (`host`), `container`          | gauge   |
+  | `forgejo_berth_cycle_last_reset_seconds` | (`host`), `container`          | gauge   |
+
+  An SSH host's cycle writes them to `<textfile_dir>/forgejo_berth_cycle_<container>.prom`
+  for node_exporter, without `host` (node_exporter's own `instance` is the host). The cycles the
+  broker runs (`docker`, `incus`) have them in the broker's `/metrics` and `metrics_file`, read
+  from their state files at every look, with the `host` label (a slot's name is the same on
+  several hosts). `jobs_total` counts since the cycle started on an SSH host; a broker's cycle
+  resumes its count from the state file. A shadow broker runs no cycles and has none.
 - `GET /state`: JSON (`last_tick`, `waiting`, `unservable`, `hosts` with `reachable` and
-  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`). The same
+  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`, and
+  `cycles`, the broker's own cycles as their metrics show them). The same
   document can be written to `state_file` atomically, for tools that read files, and the
   metrics to `metrics_file` (a node_exporter textfile collector's `.prom` file).
 - `GET /healthz`: 200 while the last look is younger than three intervals.
