@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -91,6 +92,53 @@ type Host struct {
 	// Slots names the host's slots for the docker and incus providers, whose hosts run no
 	// slot side of their own (an SSH host lists its slots itself).
 	Slots []string `yaml:"slots"`
+	// TLS, ConfigTemplate and Labels are the docker and incus providers' settings of the
+	// same names for this host's slots, where it differs from the others: a server with a
+	// certificate of its own, a runner configuration or a label table of its own. A TLS
+	// field left out, and a class the host's labels do not list, are the provider's.
+	TLS            *TLS                         `yaml:"tls"`
+	ConfigTemplate string                       `yaml:"config_template"`
+	Labels         map[string]map[string]string `yaml:"labels"`
+}
+
+// HostTLS is the TLS the provider reaches the host with: the provider's, each field the
+// host sets in place of the provider's.
+func (c *Config) HostTLS(h Host) TLS {
+	t := c.Provider.Docker.TLS
+	if c.Provider.Type == ProviderIncus {
+		t = c.Provider.Incus.TLS
+	}
+	if h.TLS != nil {
+		for _, f := range []struct {
+			to   *string
+			from string
+		}{{&t.CAFile, h.TLS.CAFile},
+			{&t.CertFile, h.TLS.CertFile}, {&t.KeyFile, h.TLS.KeyFile}} {
+			if f.from != "" {
+				*f.to = f.from
+			}
+		}
+	}
+	return t
+}
+
+// HostSlots are the slots' settings on the host: the provider's, with the host's
+// configuration template and label tables in place of the provider's (per class).
+func (c *Config) HostSlots(h Host) Slots {
+	s := c.Provider.Docker.Slots
+	if c.Provider.Type == ProviderIncus {
+		s = c.Provider.Incus.Slots
+	}
+	if h.ConfigTemplate != "" {
+		s.ConfigTemplate = h.ConfigTemplate
+	}
+	if len(h.Labels) > 0 {
+		labels := make(map[string]map[string]string, len(s.Labels)+len(h.Labels))
+		maps.Copy(labels, s.Labels)
+		maps.Copy(labels, h.Labels)
+		s.Labels = labels
+	}
+	return s
 }
 
 // CPU is the optional CPU admission. Every finished job's CPU use is recorded either way.
@@ -442,6 +490,10 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 			if len(h.Slots) > 0 {
 				fail("hosts[%d].slots: an SSH host lists its slots itself", i)
 			}
+			if h.TLS != nil || h.ConfigTemplate != "" || len(h.Labels) > 0 {
+				fail("hosts[%d]: tls, config_template and labels are the docker and incus providers'; "+
+					"an SSH host has its own in its slot files", i)
+			}
 		}
 		return
 	case ProviderDocker:
@@ -460,8 +512,10 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 		}
 	case ProviderIncus:
 		slots = p.Incus.Slots
-		if slots.ConfigTemplate == "" {
-			fail("provider.incus.config_template is required")
+		for i, h := range c.Hosts {
+			if slots.ConfigTemplate == "" && h.ConfigTemplate == "" {
+				fail("provider.incus.config_template is required (or hosts[%d].config_template)", i)
+			}
 		}
 		for name, v := range map[string]string{"config_path": p.Incus.ConfigPath, "token_path": p.Incus.TokenPath,
 			"work_dir": p.Incus.WorkDir} {
@@ -477,15 +531,11 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 		return
 	}
 	where := "provider." + p.Type
-	if len(slots.Labels) == 0 {
-		fail("%s.labels names no class", where)
-	}
-	for class, table := range slots.Labels {
-		if class != "trusted" && class != "shared" {
-			fail("%s.labels: the classes are trusted and shared, not %q", where, class)
-		}
-		if len(table) == 0 {
-			fail("%s.labels.%s is empty", where, class)
+	checkLabels(fail, where, slots.Labels)
+	for i, h := range c.Hosts {
+		checkLabels(fail, fmt.Sprintf("hosts[%d]", i), h.Labels)
+		if len(c.HostSlots(h).Labels) == 0 {
+			fail("%s.labels names no class (nor hosts[%d].labels)", where, i)
 		}
 	}
 	for class := range slots.CacheVolumes {
@@ -499,14 +549,11 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 	if slots.IdleHours < 0 || slots.JobHours < 0 || slots.BootTimeout < 0 || slots.TimeoutSeconds < 0 {
 		fail("%s: idle_hours, job_hours, boot_timeout and timeout_seconds cannot be negative", where)
 	}
-	secure := p.Docker.TLS
-	if p.Type == ProviderIncus {
-		secure = p.Incus.TLS
-	}
-	if secure.Set() && (secure.CertFile == "" || secure.KeyFile == "") {
-		fail("%s.tls: cert_file and key_file go together", where)
-	}
 	for i, h := range c.Hosts {
+		secure := c.HostTLS(h)
+		if secure.Set() && (secure.CertFile == "" || secure.KeyFile == "") {
+			fail("hosts[%d] (%s): tls: cert_file and key_file go together", i, h.Name)
+		}
 		if len(h.Slots) == 0 {
 			fail("hosts[%d].slots: a %s host names its slots", i, p.Type)
 		}
@@ -529,15 +576,27 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 		case u.Scheme == "unix" && filepath.IsAbs(u.Path):
 		case p.Type == ProviderDocker && u.Scheme == "tcp" && u.Host != "":
 			if !secure.Set() {
-				fail("hosts[%d].address %q: a tcp:// engine needs provider.docker.tls", i, h.Address)
+				fail("hosts[%d].address %q: a tcp:// engine needs provider.docker.tls (or the host's tls)", i, h.Address)
 			}
 		case p.Type == ProviderIncus && u.Scheme == "https" && u.Host != "":
 			if secure.CertFile == "" {
-				fail("hosts[%d].address %q: an https:// server needs provider.incus.tls", i, h.Address)
+				fail("hosts[%d].address %q: an https:// server needs provider.incus.tls (or the host's tls)", i, h.Address)
 			}
 		default:
 			fail("hosts[%d].address %q: unix:///path or %s", i, h.Address,
 				map[string]string{ProviderDocker: "tcp://host:port", ProviderIncus: "https://host:port"}[p.Type])
+		}
+	}
+}
+
+// checkLabels checks label tables: the classes are trusted and shared, none empty.
+func checkLabels(fail func(string, ...any), where string, labels map[string]map[string]string) {
+	for class, table := range labels {
+		if class != "trusted" && class != "shared" {
+			fail("%s.labels: the classes are trusted and shared, not %q", where, class)
+		}
+		if len(table) == 0 {
+			fail("%s.labels.%s is empty", where, class)
 		}
 	}
 }

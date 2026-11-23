@@ -28,13 +28,13 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 	d := cfg.Provider.Docker
 	hosted := slot.Hosted{}
 	for _, h := range cfg.Hosts {
-		engine, err := NewEngine(h.Address, d.TLS)
+		engine, err := NewEngine(h.Address, cfg.HostTLS(h))
 		if err != nil {
 			return nil, err
 		}
 		slots := map[string]*slot.Settings{}
 		for _, name := range h.Slots {
-			slots[name] = Settings(d.Slots, h.Name, name)
+			slots[name] = Settings(cfg.HostSlots(h), h.Name, name)
 		}
 		local, err := slot.NewLocal(slots)
 		if err != nil {

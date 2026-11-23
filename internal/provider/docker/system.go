@@ -139,7 +139,7 @@ func (d *System) Apply(a provider.Parsed) error {
 		spec.Env = append(spec.Env, "DOCKER_HOST=unix://"+hostSocket)
 		spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, Mount{Type: "bind", Source: d.cfg.HostSocket, Target: hostSocket})
 	}
-	if volume := d.cfg.CacheVolumes[a.Class]; volume != "" {
+	if volume := d.settings.CacheVolumes[a.Class]; volume != "" {
 		spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, Mount{Type: "volume", Source: volume, Target: d.cfg.CachePath})
 	}
 	if err := d.engine.Create(ctx, d.name, spec); err != nil {
@@ -157,7 +157,7 @@ func (d *System) Apply(a provider.Parsed) error {
 // runnerCommand is the runner for one job, as the wrapper's arguments.
 func (d *System) runnerCommand(a provider.Parsed) []string {
 	cmd := []string{"forgejo-runner"}
-	if d.cfg.ConfigTemplate != "" {
+	if d.settings.ConfigTemplate != "" {
 		cmd = append(cmd, "--config", filesDir+"/config.yml")
 	}
 	cmd = append(cmd, "one-job", "--wait", "--url", d.cfg.ForgejoURL, "--uuid", a.UUID,
@@ -234,8 +234,8 @@ func (d *System) files(ctx context.Context, a provider.Parsed) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d.cfg.ConfigTemplate != "" {
-		template, err := os.ReadFile(d.cfg.ConfigTemplate)
+	if d.settings.ConfigTemplate != "" {
+		template, err := os.ReadFile(d.settings.ConfigTemplate)
 		if err != nil {
 			return nil, err
 		}
@@ -246,7 +246,7 @@ func (d *System) files(ctx context.Context, a provider.Parsed) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if _, ok := d.cfg.CacheVolumes[a.Class]; ok {
+	if d.settings.CacheVolumes[a.Class] != "" {
 		// The volume's root, the runner's: it is mounted over the image's directory.
 		if err := w.WriteHeader(&tar.Header{Name: strings.TrimPrefix(path.Clean(d.cfg.CachePath), "/") + "/",
 			Typeflag: tar.TypeDir, Mode: 0o700, Uid: uid, Gid: gid, ModTime: time.Now()}); err != nil {

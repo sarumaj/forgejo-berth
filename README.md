@@ -135,8 +135,9 @@ Put `forgejo-berth` on every CI host too.
 **On each CI host** (Incus):
 
 1. Make the containers: each runs `forgejo-runner one-job` as a systemd unit, the runner's
-   configuration written from a template (see [examples/runner-config.yml](examples/runner-config.yml)).
-   Snapshot each one clean (`incus snapshot create ci-a clean`).
+   configuration written from a template (see
+   [examples/runner-config.yml](examples/runner-config.yml)). Snapshot each one clean (`incus
+   snapshot create ci-a clean`).
 2. Write a slot file per container into `/etc/forgejo-berth/slots/`
    ([examples/slot.yml](examples/slot.yml)) and start
    `forgejo-berth-cycle@<container>.service`
@@ -180,6 +181,9 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `hosts[].cpu_cores`               | 0                                       | its cores, for `cpu.overcommit`                                                         |
 | `hosts[].max_jobs`                | 0 (no cap)                              | jobs at once                                                                            |
 | `hosts[].slots`                   | required for `docker`, `incus`          | the slots' names (Incus: the containers'); an SSH host lists its own                    |
+| `hosts[].tls`                     | the provider's                          | its own `ca_file`, `cert_file`, `key_file` (`docker`, `incus`)                          |
+| `hosts[].config_template`         | the provider's                          | its own runner configuration template (`docker`, `incus`)                               |
+| `hosts[].labels`                  | the provider's                          | per class, its own label table (`docker`, `incus`)                                      |
 | `provider.type`                   | `ssh`                                   | `ssh`, `docker` or `incus`                                                              |
 | `provider.ssh.user`               | `berth`                                 | the CI hosts' account                                                                   |
 | `provider.ssh.port`               | 22                                      |                                                                                         |
@@ -208,7 +212,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.incus.tls`              | none                                    | `ca_file` (the server's certificate, pinned, or a CA), `cert_file`, `key_file`          |
 | `provider.incus.project`          | `default`                               | the containers' project                                                                 |
 | `provider.incus.snapshot`         | `clean`                                 | restored before every job                                                               |
-| `provider.incus.config_template`  | required                                | the runner's configuration, on the broker's host                                        |
+| `provider.incus.config_template`  | required (or every host's)              | the runner's configuration, on the broker's host                                        |
 | `provider.incus.config_path`      | `/etc/forgejo-runner/config.yml`        | as in a slot file ([examples/slot.yml](examples/slot.yml))                              |
 | `provider.incus.token_path`       | `/etc/forgejo-runner/token`             | as in a slot file                                                                       |
 | `provider.incus.runner_service`   | `forgejo-runner`                        | as in a slot file                                                                       |
@@ -246,8 +250,9 @@ the largest seen; an underestimate is learned at once and counted.
 
 With the `docker` provider, a host is a Docker Engine: `unix:///path` (the broker's host), or
 `tcp://host:2376` with TLS and a client certificate (`provider.docker.tls`, the key a secret
-file). The slots' reset cycles run in the broker; their state is in `state_dir`, so a restart
-of the broker leaves running jobs alone and takes them up again. For each job, a slot makes:
+file; a host's own `tls` in place of any of its files). The slots' reset cycles run in the
+broker; their state is in `state_dir`, so a restart of the broker leaves running jobs alone and
+takes them up again. For each job, a slot makes:
 
 - `<runner_prefix><host>-<slot>`: the runner's container, from `image`, running
   `forgejo-runner one-job` for the assigned runner (its token in a file of the container,
@@ -285,14 +290,15 @@ What a job can reach depends on `job_engine`:
 
 With the `incus` provider, a host is an Incus server: `https://host:8443` with the broker's
 client certificate (the server's own certificate in `tls.ca_file` is pinned: it must present
-exactly that one), or `unix:///var/lib/incus/unix.socket`. A slot is a container of
-`hosts[].slots`, as with the SSH provider; its reset cycle runs in the broker and does the same
-through the API: stop, restore the snapshot, start, wait for systemd; attach the class's cache
-volume, push the runner's configuration and token through the file API, start the runner;
-watch it with `exec` (its cgroup seen from inside); after the job, the peak from the
-instance's state (`memory.usage_peak` plus `swap_usage_peak`; the container's own
-`memory.peak` where the server reports none), the CPU from its cgroup. The state is in
-`state_dir`, as for Docker. The runner's journal is in the broker's log at debug level.
+exactly that one; a server with a certificate of its own has it in its host's `tls.ca_file`), or
+`unix:///var/lib/incus/unix.socket`. A slot is a container of `hosts[].slots`, as with the SSH
+provider; its reset cycle runs in the broker and does the same through the API: stop, restore
+the snapshot, start, wait for systemd; attach the class's cache volume, push the runner's
+configuration and token through the file API, start the runner; watch it with `exec` (its cgroup
+seen from inside); after the job, the peak from the instance's state (`memory.usage_peak` plus
+`swap_usage_peak`; the container's own `memory.peak` where the server reports none), the CPU
+from its cgroup. The state is in `state_dir`, as for Docker. The runner's journal is in the
+broker's log at debug level.
 
 ## Slot protocol
 

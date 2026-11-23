@@ -23,6 +23,21 @@ hosts:
     # The containers: each runs `forgejo-runner one-job` as runner_service, and has the
     # snapshot below.
     slots: [ci-a, ci-b]
+  # A server with a certificate of its own to pin, and a label table of its own for the
+  # trusted class (its runners have a GPU); what a host leaves out is the provider's.
+  - name: ci-2
+    address: https://ci-2.example.org:8443
+    memory_mib: 30000
+    features: [gpu]
+    slots: [ci-a, ci-b]
+    tls:
+      ca_file: /etc/forgejo-berth/incus-ci-2.crt
+    config_template: /etc/forgejo-berth/runner-config-gpu.yml
+    labels:
+      trusted:
+        ubuntu-latest: ubuntu-latest:host
+        docker: docker:docker://node:24-trixie
+        gpu: gpu:host
   # Incus on the broker's own host, through its socket (the broker's user in incus-admin).
   - name: local
     address: unix:///var/lib/incus/unix.socket

@@ -366,6 +366,13 @@ admin token, each trusted owner's token, the SSH key. A relative secret path is 
 `$CREDENTIALS_DIRECTORY` when set (systemd `LoadCredential`), else in the working directory.
 The command line takes no secret. The full reference is in the README.
 
+With the `docker` and `incus` providers, the slots' settings are the provider's, the same on
+every host, but for three a host may set for itself: `tls` (a server with a certificate of its
+own to pin, or another CA; each field it sets replaces the provider's, the others are the
+provider's), `config_template` (the runner's configuration on that host) and `labels` (per
+class: a class the host lists has the host's table, the others the provider's). A configuration
+without them reads as before. An SSH host's slots have these in their slot files, on the host.
+
 ```yaml
 forgejo:
   url: https://forgejo.example.org

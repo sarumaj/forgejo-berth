@@ -478,3 +478,40 @@ provider:
 		t.Fatal(err)
 	}
 }
+
+// Each host is reached with its own TLS where it has one: here a host's certificate to pin
+// that is not there fails that host alone.
+func TestAHostsOwnServerCertificate(t *testing.T) {
+	dir := t.TempDir()
+	serverCert, _, _ := certificate(t, dir, "server", true)
+	clientCert, clientKey, _ := certificate(t, dir, "client", false)
+	text := `
+forgejo: {url: https://forgejo.example.org, admin_token_file: admin.token}
+shared: {labels: [docker]}
+hosts:
+  - {name: ci-1, address: "https://ci-1.example.org:8443", memory_mib: 8000, slots: [ci]}
+  - {name: ci-2, address: "https://ci-2.example.org:8443", memory_mib: 8000, slots: [ci],
+     tls: {ca_file: ` + filepath.Join(dir, "missing.crt") + `}}
+history: {path: ` + filepath.Join(dir, "history.sqlite") + `}
+shadow: true
+provider:
+  type: incus
+  incus:
+    config_template: /dev/null
+    tls: {ca_file: ` + serverCert + `, cert_file: ` + clientCert + `, key_file: ` + clientKey + `}
+    labels: {shared: {docker: "docker:docker://node:24"}}
+`
+	cfg, err := config.Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "missing.crt") {
+		t.Fatalf("ci-2's own certificate was not used: %v", err)
+	}
+	cfg.Hosts = cfg.Hosts[:1]
+	hosted, err := New(cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("ci-1 with the provider's: %v", err)
+	}
+	hosted.Stop()
+}

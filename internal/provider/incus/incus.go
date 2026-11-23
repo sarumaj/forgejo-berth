@@ -32,13 +32,16 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 	timeout := time.Duration(c.TimeoutSeconds * float64(time.Second))
 	hosted := slot.Hosted{}
 	for _, h := range cfg.Hosts {
-		client, err := NewClient(h.Address, c.TLS, c.Project)
+		client, err := NewClient(h.Address, cfg.HostTLS(h), c.Project)
 		if err != nil {
 			return nil, err
 		}
+		// The host's own configuration template and label tables, where it has them.
+		hc := c
+		hc.Slots = cfg.HostSlots(h)
 		slots := map[string]*slot.Settings{}
 		for _, name := range h.Slots {
-			slots[name] = Settings(c, h.Name, name)
+			slots[name] = Settings(hc, h.Name, name)
 		}
 		local, err := slot.NewLocal(slots)
 		if err != nil {

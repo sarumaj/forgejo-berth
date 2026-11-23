@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -422,5 +423,52 @@ provider:
 	}
 	if len(f.containers) != 0 {
 		t.Fatal("shadow mode touched the engine")
+	}
+}
+
+// A host's own label table is its slots': a label it alone maps is taken there only.
+func TestAHostsOwnLabels(t *testing.T) {
+	f := newFakeEngine()
+	address := serve(t, f)
+	dir := t.TempDir()
+	cfg, err := config.Parse([]byte(`
+forgejo: {url: https://forgejo.example.org, admin_token_file: admin.token}
+shared: {labels: [docker]}
+trusted: {labels: [ubuntu-latest]}
+hosts:
+  - {name: ci-1, address: "` + address + `", memory_mib: 8000, slots: [a]}
+  - name: ci-2
+    address: "` + address + `"
+    memory_mib: 8000
+    slots: [a]
+    labels: {trusted: {ubuntu-latest: "ubuntu-latest:host"}}
+history: {path: ` + filepath.Join(dir, "history.sqlite") + `}
+shadow: true
+provider:
+  type: docker
+  docker:
+    labels: {shared: {docker: "docker:docker://node:24"}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosted, err := New(cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hosted.Stop()
+	for _, h := range []string{"ci-1", "ci-2"} {
+		if err := os.WriteFile(filepath.Join(dir, "slots", h, "a.json"), []byte(`{"state": "ready"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handoff := provider.Handoff{Assignment: "ci-2-a-7-42", UUID: testUUID, Token: testToken,
+		Labels: []string{"ubuntu-latest"}, Class: "trusted", UnusedMinutes: 15}
+	if err := hosted.Assign(t.Context(), cfg.Hosts[1], "a", handoff); err != nil {
+		t.Fatalf("ci-2 refused its own label: %v", err)
+	}
+	handoff.Assignment = "ci-1-a-7-42"
+	if err := hosted.Assign(t.Context(), cfg.Hosts[0], "a", handoff); err == nil {
+		t.Fatal("ci-1 took a label of ci-2's table")
 	}
 }

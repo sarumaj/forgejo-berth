@@ -135,19 +135,19 @@ func check(args []string, stdout, stderr io.Writer) int {
 }
 
 // checkFiles checks that the provider's files are there: the SSH key, or the TLS files
-// and the runner's configuration template.
+// and the runner's configuration templates, each host's own included.
 func checkFiles(cfg *config.Config) error {
 	var files, secrets []string
 	p := cfg.Provider
 	switch p.Type {
 	case config.ProviderSSH:
 		secrets = []string{p.SSH.KeyFile}
-	case config.ProviderDocker:
-		files = []string{p.Docker.TLS.CAFile, p.Docker.TLS.CertFile, p.Docker.ConfigTemplate}
-		secrets = []string{p.Docker.TLS.KeyFile}
-	case config.ProviderIncus:
-		files = []string{p.Incus.TLS.CAFile, p.Incus.TLS.CertFile, p.Incus.ConfigTemplate}
-		secrets = []string{p.Incus.TLS.KeyFile}
+	case config.ProviderDocker, config.ProviderIncus:
+		for _, h := range cfg.Hosts {
+			t := cfg.HostTLS(h)
+			files = append(files, t.CAFile, t.CertFile, cfg.HostSlots(h).ConfigTemplate)
+			secrets = append(secrets, t.KeyFile)
+		}
 	}
 	for _, f := range secrets {
 		if f != "" {
