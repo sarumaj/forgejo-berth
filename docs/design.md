@@ -28,8 +28,9 @@ Goals:
 Non-goals:
 
 - Creating or destroying machines. Use a cloud autoscaler for that (see the README).
-- CPU scheduling. Containers get CPU limits from their host's configuration; memory is what
-  kills jobs and stalls hosts, so memory is what berth admits by.
+- CPU scheduling as the first rule. Memory is what kills jobs and stalls hosts, so memory is
+  what berth admits by. CPU use is recorded for every job, and an optional rule admits by it
+  too ([CPU](#cpu)); it is off by default.
 - Replacing Forgejo's own job order. Forgejo decides which job a runner gets; berth predicts
   that choice (see [Claims](#claims-and-reservations)).
 
@@ -148,8 +149,12 @@ restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot \"
 {"slots": [{"container": "ci-a", "state": "ready", "state_since": 1763700000,
   "assignment": "",
   "last": {"assignment": "ci-1-ci-a-1763699000-42", "task": 8480, "peak_mib": 2345,
-           "seconds": 312.5, "unused": false}}]}
+           "seconds": 312.5, "cpu_cores": 1.85, "cpu_pressure": 0.12}}]}
 ```
+
+`cpu_cores` and `cpu_pressure` are optional: a slot side that does not measure CPU omits them,
+and the broker records no CPU figures for that run. `unused` is true for a runner that took no
+job, and omitted otherwise.
 
 `assign <container>` reads one assignment (JSON, at most 16 KiB) on standard input, checks it,
 and writes it for the container's cycle (mode 0600). It prints the assignment id. It refuses
@@ -195,7 +200,8 @@ loop:
    it took a task (a job still pulling its image). A job longer than `job_hours` is cut;
 5. **finish**: note the task id (the first `task N repo is` line of the runner's journal) and the
    container cgroup's `memory.peak` plus `memory.swap.peak` (rounded up to MiB) in the state's
-   `last`; then back to 1. The peak is the job's own: the container was started for it alone.
+   `last`, with the job's CPU use (see [CPU](#cpu)); then back to 1. The peak is the job's
+   own: the container was started for it alone.
 
 Failures back off from 30 seconds, doubling to 10 minutes. A SIGTERM ends the loop after the
 step in progress and leaves the container as it is (`stopped`).
@@ -270,6 +276,41 @@ line, or whose run cannot be read, is counted `unlearned`.
 
 **Retention.** Runs older than `retention_days` (180) are deleted, once a day.
 
+## CPU
+
+Admitting by memory alone lets two CPU-heavy jobs share a host, and each then runs about twice
+as long. A browser end-to-end suite that takes 10 minutes alone can take over 20 beside another
+such suite and hit its job timeout, while both fit in memory easily.
+
+**Recording** (always on). When the cycle first sees the job running, it reads the container
+cgroup's `cpu.stat` `usage_usec` and `cpu.pressure` `some total`; after the job it reads them
+again. The differences over the job's run time give:
+
+- `cpu_cores`: the average cores the job used (CPU time over wall time). The boot and the wait
+  before the job are left out;
+- `cpu_pressure`: the share of the job's run time during which some of its tasks waited for a
+  CPU (0 to 1; 0 where the kernel has no pressure accounting). A high value says the job was
+  slowed by its neighbours or by its container's CPU limit.
+
+Both go into the run's history row (`cpu_cores`, `cpu_pressure`, NULL when not measured), and
+into the log line of the learned job.
+
+**Prediction.** By the memory's rules (the largest of the last runs or of the spike window, job,
+family, repository), from the runs that have CPU figures, without a margin: the overcommit
+factor below is the margin. A job without any gets `cpu.unknown_cores` (1).
+
+**Admission** (optional). Either or both of:
+
+- `cpu.overcommit` above 0 (off by default): a job starts on a busy host only while the
+  predicted cores of the host's jobs, its own included, stay within the host's `cpu_cores`
+  times the factor. An average is below a job's busiest moments, so a factor of 1.5 to 2 still
+  keeps two heavy jobs apart while letting light ones pack. An idle host takes any job, as with
+  memory: a job never waits for cores no host has;
+- `hosts[].max_jobs`: at most that many jobs on the host at once, whatever they need.
+
+The predicted cores are kept with the assignment (`reserve_cores`), as its memory is. Watching
+`cpu_pressure` of the learned jobs shows whether the rule is needed and which factor fits.
+
 ## Scheduling
 
 ### Order
@@ -295,8 +336,9 @@ Forgejo hands a runner the oldest waiting job of its scope that its labels cover
 For each unclaimed job with an offer: the ready slots on hosts with its features, not held for
 another job. A job expected to need a host's whole memory or more gets the host alone (it may
 still fit with the margin and swap; it is never shut out), and only on an idle host. Otherwise it
-needs `need <= memory_mib - reserved`. Among the fitting slots the host with the most memory
-free wins, then the less busy one. Nothing starts beside a job that has a host alone.
+needs `need <= memory_mib - reserved`, and within the [CPU](#cpu) rules when they are on.
+Among the fitting slots the host with the most memory free wins, then the less busy one.
+Nothing starts beside a job that has a host alone.
 
 ### Starvation
 
@@ -362,13 +404,15 @@ shadow instance takes over. The database schema is part of the interface:
 ```sql
 CREATE TABLE runs (repo TEXT NOT NULL, name TEXT NOT NULL, family TEXT NOT NULL,
   at REAL NOT NULL, peak_mib INTEGER NOT NULL, reserved_mib INTEGER NOT NULL,
-  seconds REAL NOT NULL, host TEXT NOT NULL);
+  seconds REAL NOT NULL, host TEXT NOT NULL, cpu_cores REAL, cpu_pressure REAL);
 CREATE TABLE assignments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 ```
 
 `at` is Unix seconds. `data` is the assignment as JSON: `id`, `host`, `container`, `scope`,
 `runner_id`, `labels`, `candidates` (jobs: `id`, `run_id`, `repo_id`, `owner`, `repo`, `name`,
-`runs_on`), `reserve_mib`, `exclusive`, `since`.
+`runs_on`), `reserve_mib`, `exclusive`, `since`, and `reserve_cores` when the CPU admission is
+on. A database without the CPU columns gets them when berth opens it for writing; read-only, it
+is used without CPU figures.
 
 Taking over: stop the live instance, start berth on its history without `--shadow`. The kept
 assignments carry over (set `runner_prefix` to the old instance's prefix so the sweep spares
