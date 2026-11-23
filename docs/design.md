@@ -468,16 +468,60 @@ id). Forgejo does not say since when a job waits; a job run again arrives anew.
 
 ### Claims and reservations
 
-Forgejo hands a runner the oldest waiting job of its scope that its labels cover. So:
+Which job a runner gets is Forgejo's choice. When a runner asks for a task, Forgejo lists the
+waiting jobs the runner's scope can see, by run priority (highest first), then by when the job
+was last updated and its id (oldest first), and hands the runner the first whose `runs-on`
+labels are all among the runner's labels (`GetAvailableJobsForRunner` in
+`models/actions/task.go` and `CreateTaskForRunner` in `services/actions/task.go` of Forgejo).
+The scope decides what a runner sees:
 
-- a runner on its way (assigned, not yet running) **claims** the oldest unclaimed waiting job it
-  covers: no new runner is started for that job;
-- a new runner for a job reserves the most that this job and the older unclaimed jobs it
-  covers need, since Forgejo may hand it any of those. It does not reserve for younger jobs:
-  they go to the runners after it. Reserving for every job a runner could take would keep a host
-  to one job at a time while a large job waits;
+- an owner's runner: the jobs of that owner's repositories;
+- a global runner: the jobs of every repository, an owner's too.
+
+A runner **covers** a job when the job is in its scope and its labels cover the job's. A global
+runner thus covers a trusted owner's job that asks for shared labels only, and Forgejo may hand
+it that job before the owner's own runner asks. It covers a job no runner is offered for too,
+as long as its labels match: Forgejo knows nothing of berth's offers. berth takes the oldest
+first by its own [order](#order); it cannot see a run's priority.
+
+Which runner asks first is not known: slots boot at different speeds, and the runners of one
+pass start together. So:
+
+- the runners on their way (assigned, not yet running) **claim** jobs in the order they were
+  registered: each claims the oldest unclaimed waiting job it covers, and no new runner is
+  started for it. That order is a guess; it decides only how many runners are started. When it
+  is wrong, a runner whose job another took is released (see
+  [Release and loss](#release-and-loss)), and a job left without one gets a runner at the next
+  look;
+- a new runner for a job reserves the most that this job and every older waiting job it covers
+  need, claimed or not: if it asks before the runners that claimed them, it gets the oldest. It
+  claims the oldest unclaimed one. It does not reserve for younger jobs: they go to the runners
+  after it. Reserving for every job a runner could take would keep a host to one job at a time
+  while a large job waits;
 - a job whose reservation, or one of those older jobs', is unknown (`unknown_mib: 0`) gets a
-  host alone.
+  host alone;
+- a runner's candidates are all the waiting jobs it covers, of any owner for a global runner:
+  the job it ran is looked up among them, and it is released once none of them waits.
+
+A runner still gets a younger job than it reserved for when the runners started for younger
+jobs ask first and take its job and the older ones; berth does not reserve for that, for the
+reason above. A run priority set in Forgejo can also put a job ahead of older ones.
+
+```mermaid
+sequenceDiagram
+  participant B as berth
+  participant O as alice's runner
+  participant G as global runner
+  participant F as Forgejo
+  Note over F: waiting: alice/app test (docker, older), carol/site lint (docker)
+  B->>O: start for alice's job: reserves for it
+  B->>G: start for carol's job: reserves for both, candidates both
+  G->>F: asks first
+  F-->>G: alice's job (oldest it covers)
+  O->>F: asks
+  F-->>O: nothing of alice's waits: released, unused
+  Note over B: next look: carol's job unclaimed, a new global runner
+```
 
 ### Placement
 

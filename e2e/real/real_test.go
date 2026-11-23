@@ -344,10 +344,10 @@ history: {path: %s}
 			if err := b.Tick(ctx); err != nil {
 				t.Logf("tick: %v", err)
 			}
-			// A global runner may take an older job of a trusted owner that the broker
-			// expected an owner's runner to take: that run is not learned (unlearned).
+			// Every job is learned: a global runner that takes an older job of a trusted owner
+			// has it among its candidates.
 			c := b.Counts()
-			if c["learned"]+c["unlearned"] >= learned && c["learned"] >= learned-1 &&
+			if c["learned"] >= learned &&
 				len(b.Assignments()) == 0 && b.Snapshot().Waiting == 0 {
 				return
 			}

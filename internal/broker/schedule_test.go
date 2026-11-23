@@ -64,6 +64,31 @@ func TestOffered(t *testing.T) {
 	}
 }
 
+func TestCovers(t *testing.T) {
+	global := Offer{GlobalScope, []string{"docker"}}
+	alice := Offer{"user:alice", []string{"docker", "ubuntu-latest"}}
+	for _, tc := range []struct {
+		name   string
+		runner Offer
+		job    Job
+		want   bool
+	}{
+		{"a global runner covers anyone's job of its labels", global, job(1, repo("carol/site"), runsOn("docker")), true},
+		{"a global runner covers an owner's job of its labels", global, job(1, runsOn("docker")), true},
+		{"a global runner does not cover a label it lacks", global, job(1), false},
+		{"an owner's runner covers its owner's job", alice, job(1), true},
+		{"an owner's runner covers a job asking for some of its labels", alice, job(1, runsOn("docker")), true},
+		{"an owner's runner does not cover another owner's job", alice, job(1, repo("bob/app")), false},
+		{"no runner covers a job asking for no label", global, job(1, runsOn()), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Covers(tc.runner, tc.job); got != tc.want {
+				t.Fatalf("Covers = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFamily(t *testing.T) {
 	for name, want := range map[string]string{"server (32)": "server", "lint": "lint", "(x)": "(x)",
 		"a (b) (c)": "a (b)"} {
@@ -113,9 +138,15 @@ func TestSchedule(t *testing.T) {
 		fields []string
 	}
 	cfg := testConfig(t)
+	hostLabelsOnly := testConfig(t)
+	hostLabelsOnly.Trusted.Labels = []string{"ubuntu-latest"}
 	slotsWith := func(s []provider.Slot, extra ...provider.Slot) []provider.Slot { return append(s, extra...) }
 	run := func(host, container, assignment string) provider.Slot {
 		return provider.Slot{Host: host, Container: container, State: provider.Running, Assignment: assignment}
+	}
+	// assigned is a slot whose runner is on its way: registered, its job not taken yet.
+	assigned := func(host, container, assignment string) provider.Slot {
+		return provider.Slot{Host: host, Container: container, State: provider.Assigned, Assignment: assignment}
 	}
 	for _, tc := range []scheduleCase{
 		{
@@ -215,15 +246,16 @@ func TestSchedule(t *testing.T) {
 			needs:       map[int64]int{1: 5000, 2: 1000},
 		},
 		{
-			name:  "a runner waiting for its job claims the oldest",
+			// The runner on its way claims job 1, but the new one may ask first and get it.
+			name:  "a runner waiting for its job claims the oldest, the next reserves for it too",
 			cfg:   cfg,
 			jobs:  []Job{job(1), job(2)},
 			slots: slotsWith(ready("ci-2/ci-2"), provider.Slot{Host: "ci-1", Container: "ci", State: provider.Assigned, Assignment: "x"}),
 			assignments: []Assignment{
 				running("x", "ci-1", "ci", "user:alice", 5000, false, "ubuntu-latest")},
 			needs:  map[int64]int{1: 5000, 2: 1000},
-			want:   []placed{{Job: 2, ReserveMiB: 1000}},
-			fields: []string{"Job", "ReserveMiB"},
+			want:   []placed{{Job: 2, ReserveMiB: 5000, Candidates: "[1 2]"}},
+			fields: []string{"Job", "ReserveMiB", "Candidates"},
 		},
 		{
 			name:   "a job estimated above a host's memory gets a host alone",
@@ -291,6 +323,115 @@ func TestSchedule(t *testing.T) {
 			needs:       map[int64]int{1: 5000, 2: 1000},
 			waited:      waits(map[int64]float64{1: 900, 2: 60}, 0),
 		},
+
+		// Mixed scopes. Forgejo hands a global runner any repository's job its labels cover,
+		// an owner's runner only that owner's: alice's docker job (1, 4000 MiB) is either's,
+		// carol's docker job (2, 1000 MiB) only a global runner's.
+		{
+			name:  "both waiting: the global runner may get the owner's older job",
+			cfg:   cfg,
+			jobs:  []Job{job(1, runsOn("docker")), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: ready("ci-1/ci", "ci-2/ci-2"),
+			needs: map[int64]int{1: 4000, 2: 1000},
+			want: []placed{
+				{Job: 1, Scope: "user:alice", ReserveMiB: 4000, Candidates: "[1]"},
+				{Job: 2, Scope: "global", ReserveMiB: 4000, Candidates: "[1 2]"}},
+			fields: []string{"Job", "Scope", "ReserveMiB", "Candidates"},
+		},
+		{
+			name:  "the owner's runner on its way first, then the global one: each claims its own",
+			cfg:   cfg,
+			jobs:  []Job{job(1, runsOn("docker")), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: slotsWith(ready("ci-2/ci-2b"), assigned("ci-1", "ci", "o"), assigned("ci-2", "ci-2", "g")),
+			assignments: []Assignment{
+				running("o", "ci-1", "ci", "user:alice", 500, false, "docker"),
+				running("g", "ci-2", "ci-2", "global", 500, false, "docker")},
+			needs: map[int64]int{1: 4000, 2: 1000},
+		},
+		{
+			// The global runner, registered first, claims alice's older job: the owner's runner
+			// claims nothing, and carol's job gets a runner, which may also get alice's.
+			name:  "the global runner on its way first, then the owner's: the shared job gets a runner",
+			cfg:   cfg,
+			jobs:  []Job{job(1, runsOn("docker")), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: slotsWith(ready("ci-2/ci-2b"), assigned("ci-1", "ci", "o"), assigned("ci-2", "ci-2", "g")),
+			assignments: []Assignment{
+				running("g", "ci-2", "ci-2", "global", 1000, false, "docker"),
+				running("o", "ci-1", "ci", "user:alice", 1000, false, "docker")},
+			needs:  map[int64]int{1: 4000, 2: 1000},
+			want:   []placed{{Job: 2, Scope: "global", ReserveMiB: 4000, Candidates: "[1 2]"}},
+			fields: []string{"Job", "Scope", "ReserveMiB", "Candidates"},
+		},
+		{
+			name:  "a global runner on its way claims the owner's older job",
+			cfg:   cfg,
+			jobs:  []Job{job(1, runsOn("docker")), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: slotsWith(ready("ci-1/ci"), assigned("ci-2", "ci-2", "g")),
+			assignments: []Assignment{
+				running("g", "ci-2", "ci-2", "global", 1000, false, "docker")},
+			needs:  map[int64]int{1: 4000, 2: 1000},
+			want:   []placed{{Job: 2, Scope: "global", ReserveMiB: 4000}},
+			fields: []string{"Job", "Scope", "ReserveMiB"},
+		},
+		{
+			name:  "an owner's runner on its way does not claim the shared job",
+			cfg:   cfg,
+			jobs:  []Job{job(1, repo("carol/site"), runsOn("docker")), job(2, runsOn("docker"))},
+			slots: slotsWith(ready("ci-2/ci-2"), assigned("ci-1", "ci", "o")),
+			assignments: []Assignment{
+				running("o", "ci-1", "ci", "user:alice", 1000, false, "docker")},
+			needs:  map[int64]int{1: 4000, 2: 1000},
+			want:   []placed{{Job: 1, Scope: "global", ReserveMiB: 4000, Candidates: "[1 2]"}},
+			fields: []string{"Job", "Scope", "ReserveMiB", "Candidates"},
+		},
+		{
+			name:  "another owner's runner on its way claims nothing",
+			cfg:   cfg,
+			jobs:  []Job{job(1, runsOn("docker")), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: slotsWith(ready("ci-1/ci", "ci-2/ci-2b"), assigned("ci-2", "ci-2", "o")),
+			assignments: []Assignment{
+				running("o", "ci-2", "ci-2", "user:bob", 500, false, "docker")},
+			needs:  map[int64]int{1: 4000, 2: 1000},
+			want:   []placed{{Job: 1, Scope: "user:alice"}, {Job: 2, Scope: "global"}},
+			fields: []string{"Job", "Scope"},
+		},
+		{
+			// A shared label is all a global runner has: an owner's job asking for a trusted
+			// label is no global runner's, and does not count for one.
+			name:  "trusted labels: the global runner does not cover the owner's host job",
+			cfg:   cfg,
+			jobs:  []Job{job(1), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: ready("ci-1/ci", "ci-2/ci-2"),
+			needs: map[int64]int{1: 4000, 2: 1000},
+			want: []placed{
+				{Job: 1, Scope: "user:alice", ReserveMiB: 4000, Candidates: "[1]"},
+				{Job: 2, Scope: "global", ReserveMiB: 1000, Candidates: "[2]"}},
+			fields: []string{"Job", "Scope", "ReserveMiB", "Candidates"},
+		},
+		{
+			name:  "trusted labels: a global runner on its way leaves the owner's host job",
+			cfg:   cfg,
+			jobs:  []Job{job(1), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: slotsWith(ready("ci-1/ci"), assigned("ci-2", "ci-2", "g")),
+			assignments: []Assignment{
+				running("g", "ci-2", "ci-2", "global", 1000, false, "docker")},
+			needs:  map[int64]int{1: 4000, 2: 1000},
+			want:   []placed{{Job: 1, Scope: "user:alice", ReserveMiB: 4000}},
+			fields: []string{"Job", "Scope", "ReserveMiB"},
+		},
+		{
+			// Alice's docker job gets no runner of hers (docker is no trusted label here), but
+			// Forgejo hands it to a global runner all the same.
+			name:  "a global runner claims an owner's job berth offers no runner for",
+			cfg:   hostLabelsOnly,
+			jobs:  []Job{job(1, runsOn("docker")), job(2, repo("carol/site"), runsOn("docker"))},
+			slots: slotsWith(ready("ci-1/ci"), assigned("ci-2", "ci-2", "g")),
+			assignments: []Assignment{
+				running("g", "ci-2", "ci-2", "global", 1000, false, "docker")},
+			needs:  map[int64]int{1: 4000, 2: 1000},
+			want:   []placed{{Job: 2, Scope: "global", ReserveMiB: 4000, Candidates: "[1 2]"}},
+			fields: []string{"Job", "Scope", "ReserveMiB", "Candidates"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := summary(Schedule(tc.jobs, tc.slots, tc.assignments, fixed(tc.needs), tc.cfg, tc.waited, nil))
@@ -322,7 +463,7 @@ func TestCPUAdmission(t *testing.T) {
 	cfg.Hosts = []config.Host{{Name: "ci-1", Address: "a", MemoryMiB: 16000, CPUCores: 4}}
 	cores := func(j Job) float64 { return map[int64]float64{1: 3, 2: 3, 3: 2.5}[j.ID] }
 	needs := fixed(map[int64]int{1: 1000, 2: 1000, 3: 1000})
-	jobs := []Job{job(1, named("e2e")), job(2, named("e2e2"), runsOn("docker")), job(3, named("unit"), repo("carol/site"), runsOn("docker"))}
+	jobs := []Job{job(1, named("e2e")), job(2, named("e2e2"), runsOn("ubuntu-24.04")), job(3, named("unit"), repo("carol/site"), runsOn("docker"))}
 	got := summary(Schedule(jobs, ready("ci-1/a", "ci-1/b", "ci-1/c"), nil, needs, cfg, nil, cores))
 	// 3 cores, then 3 more would be 6 of 4 x 1.4 = 5.6: refused; 2.5 more is 5.5: admitted.
 	if len(got) != 2 || got[0].Job != 1 || got[1].Job != 3 {
