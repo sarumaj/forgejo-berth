@@ -2,7 +2,9 @@
 
 A broker that gives each waiting Forgejo Actions job an ephemeral runner on a container slot of
 a fixed host, admitted by the job's learned memory peak. One Go binary: `run` (the broker),
-`slot` (the forced SSH command on a CI host), `cycle` (one slot's reset cycle). The design is
+`slot` (the forced SSH command on a CI host), `cycle` (one slot's reset cycle). Providers:
+`ssh` (that slot command), `docker` (the slots' cycles in the broker, on an Engine
+API). The design is
 [docs/design.md](docs/design.md); keep it true when behaviour changes.
 
 ## Layout
@@ -14,11 +16,13 @@ a fixed host, admitted by the job's learned memory peak. One Go binary: `run` (t
 - `internal/history/`: SQLite (pure Go, `modernc.org/sqlite`). Its schema is an interface
   (shadow mode reads a live instance's database): add columns, never rename or drop them.
 - `internal/forgejo/`: the Forgejo API client.
-- `internal/provider/`: the slot provider interface, the SSH provider, the protocol's checks.
-- `internal/slot/`: the host side: the slot command, the reset cycle, Incus.
+- `internal/provider/`: the slot provider interface, the SSH provider, the protocol's checks;
+  `docker/`: the docker provider (the Engine API over `net/http`, a Docker slot's system).
+- `internal/slot/`: the slot side: the slot command, the reset cycle, Incus, and `Local`, the
+  slot side run in the broker for the providers that need nothing on the host.
 - `e2e/`: the broker against a fake Forgejo API and an in-memory provider; `e2e/real/` (build
-  tag `realforgejo`, run by `scripts/real-forgejo.sh`) against a real Forgejo and runner in
-  Docker.
+  tag `realforgejo`, run by `scripts/real-forgejo.sh [docker]`) against a real Forgejo and
+  runner in Docker, the second through the docker provider.
 - `examples/`: configuration, slot settings, units. `scripts/`: the release build.
 
 ## Rules
