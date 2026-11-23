@@ -61,9 +61,10 @@ sequenceDiagram
   within 30 days, times 1.2. A job without runs of its own borrows from its matrix family
   (`build (32)` from `build (31)`) or its repository, times 1.5. A job of an unknown
   repository gets 6 GiB, or a host alone. Runs are kept 180 days.
-- **Order.** Jobs go in the order they arrived. A runner reserves for the job Forgejo will hand
-  it: the oldest waiting job its scope and labels cover. A job that does not fit lets smaller
-  ones pass for 10 minutes, then holds a host until it fits.
+- **Order.** Jobs go in the order they arrived. A runner reserves for every job Forgejo may
+  hand it: the oldest waiting job its scope and labels cover, which for a global runner can be
+  an owner's job, or an older one if it asks before the runners started for those. A job that
+  does not fit lets smaller ones pass for 10 minutes, then holds a host until it fits.
 - **CPU.** Every job's average cores and CPU pressure are recorded. An optional rule keeps a
   host's predicted cores within its cores times an overcommit factor, or caps its jobs.
 

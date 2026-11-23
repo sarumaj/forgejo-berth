@@ -108,6 +108,18 @@ func Offered(job Job, cfg *config.Config) (Offer, bool) {
 	return Offer{}, false
 }
 
+// Covers tells whether Forgejo may hand a runner with the offer's scope and labels the job:
+// the labels the job runs on are all among the runner's, and the job is within the runner's
+// scope. A global runner sees every repository's jobs, an owner's runner only that owner's.
+// Whether berth would start a runner for the job (Offered) does not matter: Forgejo does not
+// know.
+func Covers(runner Offer, job Job) bool {
+	if len(job.RunsOn) == 0 || (runner.Scope != GlobalScope && runner.Scope != "user:"+job.Owner) {
+		return false
+	}
+	return subset(job.RunsOn, set(runner.Labels))
+}
+
 // Predict returns the memory to reserve for a job (MiB) from its estimate; without one
 // unknown_mib, or false (a host alone) where that is 0.
 func Predict(peak int, found bool, source string, e config.Estimate) (int, bool) {
@@ -137,11 +149,14 @@ type CoresFunc func(Job) float64
 // served by a runner, a ready slot on a host with its features and the memory it needs free.
 //
 // The jobs go in the order they arrived (waited). Forgejo hands a runner the oldest waiting
-// job of its scope that its labels cover, so a runner reserves the most that the job and the
-// older ones it could get instead need: those not yet claimed by a runner started before,
-// not the younger ones, which go to the runners after it. A job that does not fit lets
-// younger ones go ahead until it has waited starve_minutes; then it holds the host fit for
-// it with the most memory free, where nothing else starts until it does.
+// job it covers (see Covers): a global runner any owner's, an owner's runner only that
+// owner's. Which runner asks first is not known (slots boot at different speeds), so the
+// runners on their way claim jobs in the order they were registered, which decides only
+// which jobs get no new runner; a new runner reserves the most that its job and every older
+// job it covers need, claimed or not, as it gets one of them if it asks first. It does not
+// reserve for the younger ones, which go to the runners after it. A job that does not fit
+// lets younger ones go ahead until it has waited starve_minutes; then it holds the host fit
+// for it with the most memory free, where nothing else starts until it does.
 func Schedule(jobs []Job, slots []provider.Slot, assignments []Assignment, reserve ReserveFunc,
 	cfg *config.Config, waited WaitedFunc, cores CoresFunc) []Placement {
 	if waited == nil {
@@ -183,13 +198,11 @@ func Schedule(jobs []Job, slots []provider.Slot, assignments []Assignment, reser
 			alone[a.Host] = true
 		}
 	}
-	covers := func(runner Offer, job Job) bool {
-		o := runners[job.ID]
-		return o != nil && o.Scope == runner.Scope && subset(job.RunsOn, set(runner.Labels))
-	}
 
 	// The jobs a runner is on its way to: each runner still waiting for its job claims the
-	// oldest unclaimed one it covers, as Forgejo will hand it that.
+	// oldest unclaimed one it covers, as Forgejo will hand it that if the runners ask in the
+	// order they were registered (assignments come oldest first). A global runner may thus
+	// claim an owner's job before that owner's runner registered after it.
 	claimed := map[int64]bool{}
 	states := map[[2]string]string{}
 	for _, s := range slots {
@@ -201,7 +214,7 @@ func Schedule(jobs []Job, slots []provider.Slot, assignments []Assignment, reser
 		}
 		key := Offer{Scope: a.Scope, Labels: a.Labels}
 		for _, j := range waiting {
-			if !claimed[j.ID] && covers(key, j) {
+			if !claimed[j.ID] && Covers(key, j) {
 				claimed[j.ID] = true
 				break
 			}
@@ -253,17 +266,24 @@ func Schedule(jobs []Job, slots []provider.Slot, assignments []Assignment, reser
 		}
 		var candidates []Job
 		for _, other := range waiting {
-			if covers(*runner, other) {
+			if Covers(*runner, other) {
 				candidates = append(candidates, other)
 			}
 		}
-		// The jobs this runner may get: this one and the older ones not claimed, oldest first.
+		// The jobs this runner may get: this one and the older ones, oldest first. Those that
+		// other runners claimed count too: a runner on its way, or one started in this pass,
+		// may ask after this one, which then gets the oldest. It claims the oldest unclaimed.
 		var ahead []Job
+		first := job
 		for _, other := range candidates {
-			if !claimed[other.ID] {
-				ahead = append(ahead, other)
-			}
+			ahead = append(ahead, other)
 			if other.ID == job.ID {
+				break
+			}
+		}
+		for _, other := range ahead {
+			if !claimed[other.ID] {
+				first = other
 				break
 			}
 		}
@@ -353,7 +373,7 @@ func Schedule(jobs []Job, slots []provider.Slot, assignments []Assignment, reser
 		ready = slices.DeleteFunc(ready, func(s provider.Slot) bool {
 			return s.Host == chosen.slot.Host && s.Container == chosen.slot.Container
 		})
-		claimed[ahead[0].ID] = true
+		claimed[first.ID] = true
 		used[chosen.slot.Host] += reserved
 		usedCores[chosen.slot.Host] += needCores
 		busy[chosen.slot.Host]++
