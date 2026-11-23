@@ -321,7 +321,7 @@ func (d *System) Busy() bool { return d.task() != 0 }
 // TookTask tells whether the runner's log shows it took a task.
 func (d *System) TookTask() bool { return d.task() != 0 }
 
-// SaveJournal logs the runner's output, its last journal_lines, as one record: the
+// SaveJournal logs the runner's output, its last journal_lines, as one record (debug): the
 // container goes at the next reset. A job's own output is Forgejo's, not the runner's.
 func (d *System) SaveJournal() {
 	ctx, cancel := d.ctx(1)
@@ -331,7 +331,7 @@ func (d *System) SaveJournal() {
 		d.log.Warn("the runner's log could not be read", "error", err)
 		return
 	}
-	d.log.Info("the runner's log", "log", strings.TrimRight(logs, "\n"))
+	d.log.Debug("the runner's log", "log", strings.TrimRight(logs, "\n"))
 }
 
 // containers are the slot's containers whose cgroups count: the runner's, and its Docker's,
