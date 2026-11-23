@@ -1,0 +1,402 @@
+# forgejo-berth design
+
+forgejo-berth gives every waiting Forgejo Actions job a runner of its own, on a fixed host
+where the job's memory fits. It registers an ephemeral runner (one job, then Forgejo removes it
+and its token) and hands it to a container slot that was reset for that job alone. It learns
+each job's memory peak from the slot after the job, and uses the history to pack later jobs onto
+the hosts.
+
+It fills a gap. Other autoscalers create machines on demand: cloud VMs per job, VM pools, or
+Kubernetes pods scaled by the number of pending jobs. forgejo-berth is for hosts you already
+have and pay for, whatever load they carry: it decides which job runs where, and when a job
+waits because it would not fit.
+
+## Goals and non-goals
+
+Goals:
+
+- One runner per job, registered just in time, deleted when unused. No long-lived runner token
+  on a CI host.
+- Admission by learned memory: a job starts on a host only when its predicted peak fits beside
+  the reservations of the jobs already running there.
+- Trusted owners may get runners with more powerful labels (for example host-mode execution);
+  everyone else gets the shared labels only.
+- One static binary (`CGO_ENABLED=0`): the broker, the slot's forced command and the reset
+  cycle.
+- A shadow mode that computes and logs decisions without acting, next to a live instance.
+
+Non-goals:
+
+- Creating or destroying machines. Use a cloud autoscaler for that (see the README).
+- CPU scheduling. Containers get CPU limits from their host's configuration; memory is what
+  kills jobs and stalls hosts, so memory is what berth admits by.
+- Replacing Forgejo's own job order. Forgejo decides which job a runner gets; berth predicts
+  that choice (see [Claims](#claims-and-reservations)).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  F[Forgejo API]
+  subgraph broker[forgejo-berth run]
+    L[look every interval]
+    H[(history SQLite)]
+    S[scheduler]
+  end
+  subgraph host[CI host]
+    C[forgejo-berth slot<br/>forced SSH command]
+    Y[forgejo-berth cycle<br/>one per container]
+    K[Incus container<br/>runner, one job]
+  end
+  L -- waiting jobs --> F
+  L -- status --> C
+  L --> S
+  S -- predicted peak --> H
+  S -- register ephemeral runner --> F
+  S -- assign uuid, token, labels --> C
+  C -- assignment file --> Y
+  Y -- reset, configure, start --> K
+  K -- takes one job --> F
+  Y -- task and peak in its state --> C
+```
+
+The broker is one loop. Every `interval_seconds` it:
+
+1. asks every host for its slots (`Provider.Status`). A host that does not answer is marked
+   unreachable; its slots get nothing, its assignments are kept;
+2. settles each slot that finished an assignment: an unused runner is deleted; a runner that ran
+   a job is looked up (which of its candidate jobs had that task id, and how it ended), and a job
+   that ended `success` or `failure` is recorded with its peak;
+3. forgets assignments no slot reports any more (after 90 seconds), and at once those on hosts
+   removed from the configuration; their runners are deleted;
+4. reads the waiting jobs (`GET /api/v1/admin/runners/jobs`), prunes the history once a day,
+   releases idle runners none of whose jobs wait any more;
+5. schedules: for each waiting job in arrival order, picks a slot and starts a runner there
+   (register, keep the assignment, `Provider.Assign`);
+6. publishes its state and metrics.
+
+At start it sweeps the runners whose name has the configured prefix and that no kept assignment
+holds (left by a crash between registering and keeping).
+
+### Packages
+
+| Package              | Role                                                                     |
+| -------------------- | ------------------------------------------------------------------------ |
+| `cmd/forgejo-berth`  | subcommands `run`, `slot`, `cycle`, `check`, `version`                   |
+| `internal/config`    | the broker's YAML configuration, defaults and validation                 |
+| `internal/broker`    | jobs, slots, assignments; offer, predict, schedule; the loop             |
+| `internal/history`   | SQLite: finished runs and the assignments held across restarts           |
+| `internal/forgejo`   | the Forgejo API client (admin and owner tokens)                          |
+| `internal/provider`  | the slot provider interface and the SSH provider                         |
+| `internal/slot`      | the host side: the forced command and the reset cycle (Incus)            |
+| `internal/web`       | `/metrics`, `/state`, `/healthz`                                         |
+
+## Slot provider interface
+
+```go
+type Provider interface {
+    // Status lists the host's slots: state, current assignment, and the last finished
+    // assignment with its task id, peak memory and duration.
+    Status(ctx context.Context, host config.Host) ([]Slot, error)
+    // Assign hands a ready slot a runner. An error means the slot refused; the broker then
+    // deletes the runner.
+    Assign(ctx context.Context, host config.Host, container string, h Handoff) error
+    // Release asks the slot to stop the assignment's runner if it has no job yet.
+    Release(ctx context.Context, host config.Host, container, assignment string) error
+}
+```
+
+A finished slot's peak and task id are part of `Status` (the `last` object), so a slot needs no
+separate query after its job: the broker reads them at the next look, before the slot takes a
+new assignment.
+
+The first provider is `ssh`: every host is reached as one user whose authorized key forces
+`forgejo-berth slot`. The protocol is below. A local provider (Incus or Docker on the broker's
+own host) would implement the same three calls by running the slot logic in-process; the
+interface leaves room for it, none is built yet.
+
+### Slot states
+
+| State       | Meaning                                                                  |
+| ----------- | ------------------------------------------------------------------------ |
+| `ready`     | reset, no runner, takes an assignment                                    |
+| `pending`   | an assignment is written but the cycle has not taken it yet              |
+| `assigned`  | the cycle took the assignment; the runner waits for its job              |
+| `running`   | the runner runs its job                                                  |
+| `resetting` | the container is being restored from its snapshot                        |
+| `failed`    | a reset or a runner start failed; the cycle backs off and tries again    |
+| `stopped`   | the cycle is not running                                                 |
+
+A slot is free only when it is `ready` with no assignment and no kept assignment of the broker
+names it.
+
+## Slot protocol (SSH)
+
+The broker runs `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i <key> -p <port>
+<user>@<address> <command>`. The host's `authorized_keys` forces the command, for example:
+
+```text
+restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA…
+```
+
+`forgejo-berth slot` takes the whole requested command as one argument (or from
+`SSH_ORIGINAL_COMMAND`) and knows three commands. Anything else exits 1 with a usage line.
+
+`status` prints JSON on standard output. Tokens are never part of it.
+
+```json
+{"slots": [{"container": "ci-a", "state": "ready", "state_since": 1763700000,
+  "assignment": "",
+  "last": {"assignment": "ci-1-ci-a-1763699000-42", "task": 8480, "peak_mib": 2345,
+           "seconds": 312.5, "unused": false}}]}
+```
+
+`assign <container>` reads one assignment (JSON, at most 16 KiB) on standard input, checks it,
+and writes it for the container's cycle (mode 0600). It prints the assignment id. It refuses
+(exit 1, the reason on standard error) a container that is not a slot, a slot not `ready`, a slot
+with an assignment already waiting, and an assignment out of shape.
+
+```json
+{"assignment": "ci-1-ci-a-1763700000-42", "uuid": "0f0e0d0c-0b0a-4908-8706-050403020100",
+ "token": "<runner token>", "labels": ["ubuntu-latest"], "class": "trusted",
+ "unused_minutes": 15}
+```
+
+| Field            | Check                                                                 |
+| ---------------- | --------------------------------------------------------------------- |
+| `assignment`     | `[a-z0-9][a-z0-9-]{0,127}`                                            |
+| `uuid`           | a lowercase UUID                                                      |
+| `token`          | `[0-9A-Za-z_-]{20,256}`                                               |
+| `class`          | `trusted` or `shared`, and configured on the slot                     |
+| `labels`         | not empty, every name in the class's label table of the slot          |
+| `unused_minutes` | 1 to 1440                                                             |
+
+`release <container> <assignment>` asks the cycle to stop the assignment's runner if it still
+has no job. It refuses a slot that does not hold that assignment.
+
+The host maps label *names* to runner labels by the class's own table, so a shared runner can
+never get a host label, whatever the broker sends. The broker sends names only.
+
+## Reset cycle
+
+`forgejo-berth cycle <container>` runs as root, one per container (a systemd template unit). Its
+loop:
+
+1. **reset**: drop any assignment not yet taken (its runner was deleted), stop the container,
+   restore the snapshot, start it, wait for systemd in it to be `running` or `degraded`;
+2. **ready**: wait for an assignment file; parse it as `slot assign` did. One out of shape is
+   dropped. After `idle_hours` the container is refreshed (back to 1);
+3. **assigned**: attach the class's cache volume, write the runner's configuration (a template
+   with `@@RUNNER_UUID@@` and `@@RUNNER_LABELS@@`) and its token into the container, start the
+   runner's service;
+4. **running**: the runner took its job (a step's process, a host-mode job directory or a
+   populated Docker scope under the runner's cgroup). A runner with no job after the
+   assignment's `unused_minutes`, or released by the broker, is stopped, unless its journal shows
+   it took a task (a job still pulling its image). A job longer than `job_hours` is cut;
+5. **finish**: note the task id (the first `task N repo is` line of the runner's journal) and the
+   container cgroup's `memory.peak` plus `memory.swap.peak` (rounded up to MiB) in the state's
+   `last`; then back to 1. The peak is the job's own: the container was started for it alone.
+
+Failures back off from 30 seconds, doubling to 10 minutes. A SIGTERM ends the loop after the
+step in progress and leaves the container as it is (`stopped`).
+
+The state goes to `<state_dir>/<container>.json`; the assignment to `<container>.assignment`,
+the release to `<container>.release`.
+
+## Configuration
+
+One YAML file, `--config` (default `/etc/forgejo-berth/config.yml`). Secrets are files: the
+admin token, each trusted owner's token, the SSH key. A relative secret path is looked up in
+`$CREDENTIALS_DIRECTORY` when set (systemd `LoadCredential`), else in the working directory.
+The command line takes no secret. The full reference is in the README.
+
+```yaml
+forgejo:
+  url: https://forgejo.example.org
+  admin_token_file: admin.token        # write:admin, read:repository
+trusted:
+  owners:
+    alice: alice.token                 # write:user of alice
+  labels: [ubuntu-latest, docker]
+shared:
+  labels: [docker]
+hosts:
+  - name: ci-1
+    address: ci-1.example.org
+    memory_mib: 14000
+    features: [gpu]
+provider:
+  type: ssh
+  ssh: {user: berth, port: 22, key_file: ssh_key,
+        known_hosts_file: /etc/forgejo-berth/known_hosts}
+```
+
+## Who may get which runner
+
+`offer(job)`:
+
+- a job of a trusted owner gets a runner at that owner's user scope
+  (`POST /api/v1/user/actions/runners` with the owner's token), with the labels it asks for, if
+  each is a trusted label or a host feature; otherwise none;
+- anyone else's job gets a global runner (`POST /api/v1/admin/actions/runners`) if each label it
+  asks for is a shared label; otherwise none;
+- a job asking for no label gets none.
+
+Jobs no runner may take are counted (`unservable`) and left to other runners.
+
+A job asking for a feature goes only to hosts that have it.
+
+## Learning
+
+The history keeps every learned run: repository, job name, family (the name without a trailing
+matrix part: `build (32)` is of family `build`), time, peak MiB, reserved MiB (0 for a host
+alone), seconds, host.
+
+**Estimate.** For a job, the largest peak among its last `history_runs` (5) runs and its runs
+within `spike_days` (30), whichever reach further back. A rare spike thus counts for a month,
+and a pattern that changed fades after five runs. Looked up for the job itself, then its family,
+then its repository; the first that has runs wins.
+
+**Prediction.** The estimate times `margin` (1.2) for the job's own history, times
+`relative_margin` (1.5) for a family's or repository's, at least `floor_mib` (512). A job
+without any history gets `unknown_mib` (6144): enough for a typical container build, while a
+host of 12 GiB or more still runs something beside it; its first run teaches the history. With
+`unknown_mib: 0` such a job gets a host alone.
+
+**Learned ends.** Only `success` and `failure`: a cancelled job stopped early, its peak says
+little. A job whose peak exceeded what was reserved is learned at once and counted
+(`underestimated`): many of them mean the margins are too small. A job that ran without a task
+line, or whose run cannot be read, is counted `unlearned`.
+
+**Retention.** Runs older than `retention_days` (180) are deleted, once a day.
+
+## Scheduling
+
+### Order
+
+Jobs are taken in the order the broker first saw them waiting (longest waiting first, then by
+id). Forgejo does not say since when a job waits; a job run again arrives anew.
+
+### Claims and reservations
+
+Forgejo hands a runner the oldest waiting job of its scope that its labels cover. So:
+
+- a runner on its way (assigned, not yet running) **claims** the oldest unclaimed waiting job it
+  covers: no new runner is started for that job;
+- a new runner for a job reserves the most that this job and the older unclaimed jobs it
+  covers need, since Forgejo may hand it any of those. It does not reserve for younger jobs:
+  they go to the runners after it. Reserving for every job a runner could take would keep a host
+  to one job at a time while a large job waits;
+- a job whose reservation, or one of those older jobs', is unknown (`unknown_mib: 0`) gets a
+  host alone.
+
+### Placement
+
+For each unclaimed job with an offer: the ready slots on hosts with its features, not held for
+another job. A job expected to need a host's whole memory or more gets the host alone (it may
+still fit with the margin and swap; it is never shut out), and only on an idle host. Otherwise it
+needs `need <= memory_mib - reserved`. Among the fitting slots the host with the most memory
+free wins, then the less busy one. Nothing starts beside a job that has a host alone.
+
+### Starvation
+
+A job that does not fit lets younger, smaller jobs go ahead until it has waited
+`starve_minutes` (10). Then it holds the fitting host with the most memory free: nothing new
+starts there until the job fits.
+
+### Release and loss
+
+- An assigned runner none of whose candidate jobs waits any more (cancelled, deleted, taken by
+  another runner) is released once it is 60 seconds old and seen so at two looks in a row.
+- The slot's cycle stops a runner unused for `unused_minutes` (15) anyway.
+- An assignment no slot reports for 90 seconds is lost (its cycle restarted before taking it);
+  its runner is deleted. One on a host no longer configured is lost at once.
+
+## Observability
+
+- `GET /metrics`: Prometheus text format, hand-written (no client library):
+
+  | Metric                              | Labels   | Kind    |
+  | ----------------------------------- | -------- | ------- |
+  | `forgejo_berth_last_tick_seconds`   |          | gauge   |
+  | `forgejo_berth_waiting_jobs`        | `kind`   | gauge   |
+  | `forgejo_berth_host_reachable`      | `host`   | gauge   |
+  | `forgejo_berth_reserved_mib`        | `host`   | gauge   |
+  | `forgejo_berth_events_total`        | `event`  | counter |
+  | `forgejo_berth_estimates`           | `source` | gauge   |
+  | `forgejo_berth_jobs_learned`        |          | gauge   |
+  | `forgejo_berth_shadow`              |          | gauge   |
+
+  Events: `assigned`, `learned`, `unlearned`, `unused`, `failed`, `underestimated`, `released`,
+  and in shadow mode `would_assign`.
+- `GET /state`: JSON (`last_tick`, `waiting`, `unservable`, `hosts` with `reachable` and
+  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`). The same
+  document can be written to `state_file` atomically, for tools that read files.
+- `GET /healthz`: 200 while the last look is younger than three intervals.
+- Logs: `log/slog`, text or JSON (`log.format`), one line per decision.
+
+## Security
+
+- The admin token and the owners' tokens are read from files at start and never logged.
+- A runner's token exists in the broker's memory from registration until `Assign` returned; it
+  is not kept in the history (the kept assignment has no token), not in the state, not in logs.
+  On the host it lives in the assignment file (0600, root) until the cycle takes it, then in the
+  container until the next reset.
+- SSH: `StrictHostKeyChecking=yes`, `BatchMode=yes`, the key from the configuration with
+  `IdentitiesOnly=yes`; the host side forces one command and parses its arguments strictly.
+- A runner name has a configured prefix (`runner_prefix`, `berth-`): the sweep deletes runners
+  of that prefix only.
+
+## Shadow mode
+
+`forgejo-berth run --shadow` (or `shadow: true`) runs every look but acts on nothing: it
+registers, assigns, releases and deletes no runner, sweeps nothing and records no run. It logs
+each placement it would make (`would assign`) and counts them.
+
+The history is opened read-only in shadow mode, and the kept assignments are read from it at
+every look. A shadow instance can therefore point `history.path` at the database of a live
+instance on the same host (SQLite allows concurrent readers): it predicts from the live history
+and sees the live reservations, so its decisions can be compared with the live log before the
+shadow instance takes over. The database schema is part of the interface:
+
+```sql
+CREATE TABLE runs (repo TEXT NOT NULL, name TEXT NOT NULL, family TEXT NOT NULL,
+  at REAL NOT NULL, peak_mib INTEGER NOT NULL, reserved_mib INTEGER NOT NULL,
+  seconds REAL NOT NULL, host TEXT NOT NULL);
+CREATE TABLE assignments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+```
+
+`at` is Unix seconds. `data` is the assignment as JSON: `id`, `host`, `container`, `scope`,
+`runner_id`, `labels`, `candidates` (jobs: `id`, `run_id`, `repo_id`, `owner`, `repo`, `name`,
+`runs_on`), `reserve_mib`, `exclusive`, `since`.
+
+Taking over: stop the live instance, start berth on its history without `--shadow`. The kept
+assignments carry over (set `runner_prefix` to the old instance's prefix so the sweep spares
+nothing it should delete and deletes its leftovers).
+
+## Forgejo API used
+
+| Call                                                      | Token        | Purpose             |
+| --------------------------------------------------------- | ------------ | ------------------- |
+| `GET /api/v1/admin/runners/jobs`                          | admin        | waiting jobs        |
+| `GET /api/v1/repositories/{id}`                           | admin        | owner and full name |
+| `POST /api/v1/admin/actions/runners`                      | admin        | global runner       |
+| `POST /api/v1/user/actions/runners`                       | owner        | owner's runner      |
+| `GET`, `DELETE` the same paths (`/{id}`)                  | admin, owner | sweep, delete       |
+| `GET /api/v1/repos/{owner}/{repo}/actions/runs/{id}/jobs` | admin        | task id, conclusion |
+
+The registration body is `{"name": …, "ephemeral": true}`; the answer has `id`, `uuid` and
+`token`. An owner's token needs `write:user`; the admin token `write:admin` and
+`read:repository`. Lists are paged (`page`, `limit=50`, at most 40 pages), with or without a
+wrapping object (`jobs`, `runners`). A 404 on delete is success (Forgejo removed the ephemeral
+runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
+
+## Testing
+
+- The scheduler, the estimate and the broker's look are tested table-driven, with a fake forge
+  and a fake provider, on a fake clock.
+- The Forgejo client is tested against an `httptest` server that serves the API's shapes.
+- An end-to-end test runs the broker against a fake Forgejo (`httptest`) and an in-memory
+  provider that plays the slot's life: ready, assigned, running, finished with a peak, learned,
+  and the next run packed by it.
+- The slot command and the cycle are tested on a temporary directory with a fake system.

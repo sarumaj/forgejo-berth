@@ -1,0 +1,7 @@
+# Lines of at most 100 characters (tables and code blocks excepted), tables aligned.
+MD013:
+  line_length: 100
+  tables: false
+  code_blocks: false
+MD060:
+  style: aligned
