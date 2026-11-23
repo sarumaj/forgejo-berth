@@ -443,6 +443,13 @@ func (b *Broker) forgetLost(ctx context.Context, seen []provider.Slot, now float
 		if !configured || !holding[a.ID] {
 			delete(b.assigned, a.ID)
 			b.drop(a.ID)
+			if b.shadow {
+				// The live instance's assignment: that instance finds it lost and deletes its
+				// runner, the shadow does neither and only notes it.
+				b.log.Debug("the live instance's runner looks lost", "host", a.Host, "container", a.Container,
+					"assignment", a.ID)
+				continue
+			}
 			b.log.Warn("lost its runner", "host", a.Host, "container", a.Container, "assignment", a.ID)
 			b.delete(ctx, a)
 		}

@@ -358,6 +358,17 @@ func TestAnAssignmentOnAHostNoLongerConfiguredIsForgotten(t *testing.T) {
 	}
 }
 
+func TestShadowModeDoesNotReportTheLiveInstancesLostRunners(t *testing.T) {
+	h := newHarness(t, "shadow: true")
+	h.assigned["old"] = Assignment{ID: "old", Host: "ci-3", Container: "ci", Scope: "user:alice", RunnerID: 5,
+		Labels: []string{"docker"}, ReserveMiB: 1000}
+	h.slots.slots = map[string][]provider.Slot{"ci-1": {}, "ci-2": {}}
+	h.tick(t)
+	if len(h.forge.deleted) != 0 || strings.Contains(h.logs.String(), "lost its runner") {
+		t.Fatalf("deleted %v, logs %s", h.forge.deleted, h.logs.String())
+	}
+}
+
 func TestARunnerNoSlotHoldsAnyMoreIsDeleted(t *testing.T) {
 	h := newHarness(t)
 	assigned7(t, h)

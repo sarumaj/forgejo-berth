@@ -13,12 +13,12 @@ share a host when they fit and wait when they would not.
 
 forgejo-berth fills a gap. Most autoscalers for Forgejo runners create machines on demand:
 
-| Project                                                               | What it does                                      |
-| --------------------------------------------------------------------- | ------------------------------------------------- |
-| [fj-bellows](https://github.com/hstern/fj-bellows)                    | a cloud VM per job                                |
-| forgejo-autoscale-runner                                              | VM pools on Scaleway, OVH and Hetzner Cloud       |
-| [KEDA's Forgejo scaler](https://keda.sh/docs/latest/scalers/forgejo/) | Kubernetes workloads scaled by pending jobs       |
-| **forgejo-berth**                                                     | per-job runners packed onto fixed hosts by memory |
+| Project                                                                           | What it does                                      |
+| --------------------------------------------------------------------------------- | ------------------------------------------------- |
+| [fj-bellows](https://github.com/hstern/fj-bellows)                                | a cloud VM per job                                |
+| [forgejo-autoscale-runner](https://codeberg.org/benoitc/forgejo-autoscale-runner) | VM pools on Scaleway, OVH and Hetzner Cloud       |
+| [KEDA's Forgejo scaler](https://keda.sh/docs/latest/scalers/forgejo/)             | Kubernetes workloads scaled by pending jobs       |
+| **forgejo-berth**                                                                 | per-job runners packed onto fixed hosts by memory |
 
 Use one of the others when you want machines created and destroyed per job. Use forgejo-berth
 when your CI runs on a few hosts you keep anyway (a dedicated server, a machine at home, spare
