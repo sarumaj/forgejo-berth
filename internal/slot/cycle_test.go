@@ -505,3 +505,19 @@ func TestApplyWritesTheConfigurationAndToken(t *testing.T) {
 		t.Fatalf("stdins %q", stdins)
 	}
 }
+
+// A job short enough to start and end between two looks is still the runner's job: its
+// runner took a task.
+func TestAJobBetweenTwoLooksIsAJob(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: []look{{true, false}, {false, false}}, took: true, task: 9, peak: 64}
+	c := newCycle(t, dir, sys, sys.clock.stop(100))
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	if !c.Serve(a) {
+		t.Fatal("serve failed")
+	}
+	if last := c.Last(); last.Unused || last.Task != 9 || last.PeakMiB != 64 || last.CPUCores != 0 {
+		t.Fatalf("last %+v", last)
+	}
+}

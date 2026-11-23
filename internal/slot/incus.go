@@ -375,7 +375,19 @@ func (i *Incus) CPU() (int64, int64, bool) {
 // tasks waited for a CPU (cpu.pressure, some total), in microseconds. Without pressure
 // accounting (no cpu.pressure) the pressure is 0.
 func CPUCounters(cgroup string) (int64, int64, bool) {
-	stat, err := os.ReadFile(filepath.Join(cgroup, "cpu.stat"))
+	return CgroupCPU(dirReader(cgroup))
+}
+
+// CgroupReader reads one of a cgroup's files by its name.
+type CgroupReader func(name string) ([]byte, error)
+
+func dirReader(dir string) CgroupReader {
+	return func(name string) ([]byte, error) { return os.ReadFile(filepath.Join(dir, name)) }
+}
+
+// CgroupCPU is CPUCounters of a cgroup read through read.
+func CgroupCPU(read CgroupReader) (int64, int64, bool) {
+	stat, err := read("cpu.stat")
 	if err != nil {
 		return 0, 0, false
 	}
@@ -384,7 +396,7 @@ func CPUCounters(cgroup string) (int64, int64, bool) {
 		return 0, 0, false
 	}
 	var pressure int64
-	if data, err := os.ReadFile(filepath.Join(cgroup, "cpu.pressure")); err == nil {
+	if data, err := read("cpu.pressure"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			if strings.HasPrefix(line, "some ") {
 				pressure, _ = field(strings.ReplaceAll(line, " ", "\n"), "total=")
@@ -407,9 +419,14 @@ func field(text, prefix string) (int64, bool) {
 
 // PeakMiB is memory.peak plus memory.swap.peak of the cgroup, in MiB rounded up.
 func PeakMiB(cgroup string) int {
+	return ToMiB(CgroupPeak(dirReader(cgroup)))
+}
+
+// CgroupPeak is memory.peak plus memory.swap.peak of a cgroup read through read, in bytes.
+func CgroupPeak(read CgroupReader) int64 {
 	var bytes int64
 	for _, counter := range []string{"memory.peak", "memory.swap.peak"} {
-		data, err := os.ReadFile(filepath.Join(cgroup, counter))
+		data, err := read(counter)
 		if err != nil {
 			continue
 		}
@@ -417,5 +434,10 @@ func PeakMiB(cgroup string) int {
 			bytes += n
 		}
 	}
+	return bytes
+}
+
+// ToMiB rounds bytes up to MiB.
+func ToMiB(bytes int64) int {
 	return int((bytes + 1<<20 - 1) >> 20)
 }

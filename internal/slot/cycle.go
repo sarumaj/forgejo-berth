@@ -68,9 +68,15 @@ type Cycle struct {
 	lastResetAt      time.Time
 	assignment       string
 	last             *provider.Finished
+	// servedSince is when the assignment's runner started, jobSince when its job was first
+	// seen, unusedMinutes how long it may wait for one: kept in the state, so that a cycle
+	// that resumes takes the assignment up where it was.
+	servedSince, jobSince time.Time
+	unusedMinutes         float64
 	// cpuAtJob is the container's CPU counters when the job was first seen.
 	cpuAtJob [2]int64
 	cpuOK    bool
+	resume   bool
 }
 
 // CycleOptions are the cycle's collaborators; nil ones are the real ones.
@@ -79,12 +85,16 @@ type CycleOptions struct {
 	Now      func() time.Time
 	Sleep    func(time.Duration)
 	Stopping func() bool
+	// Resume takes up, at the start, the assignment the slot's last cycle left (a cycle in
+	// the broker's process, which a restart of the broker stops), instead of resetting the
+	// container under its job.
+	Resume bool
 }
 
 // NewCycle makes the cycle of one slot.
 func NewCycle(s *Settings, system System, o CycleOptions) *Cycle {
 	c := &Cycle{settings: s, system: system, log: o.Log, now: o.Now, sleep: o.Sleep, stopping: o.Stopping,
-		state: "starting", last: &provider.Finished{}}
+		state: "starting", last: &provider.Finished{}, resume: o.Resume}
 	if c.log == nil {
 		c.log = slog.Default()
 	}
@@ -108,6 +118,9 @@ func (c *Cycle) interval() time.Duration {
 
 // Run resets, serves one assignment, and starts over, until stopping.
 func (c *Cycle) Run() {
+	if c.resume && !c.Resume() {
+		c.backOff()
+	}
 	for !c.stopping() {
 		if !c.Reset() {
 			c.backOff()
@@ -209,8 +222,15 @@ func (c *Cycle) Serve(a provider.Parsed) bool {
 		return false
 	}
 	c.setState(provider.Assigned)
-	started := c.now()
-	var jobSince time.Time
+	return c.watch(a, c.now(), time.Time{})
+}
+
+// watch waits for the runner's job to end, from the runner's start (and its job's, when it
+// was seen already); false when the runner failed.
+func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
+	c.assignment, c.servedSince, c.jobSince, c.unusedMinutes = a.ID, started, jobSince, a.UnusedMinutes
+	c.write()
+	lastLook := started
 	for {
 		c.sleep(c.interval())
 		if c.stopping() {
@@ -218,8 +238,13 @@ func (c *Cycle) Serve(a provider.Parsed) bool {
 			return true
 		}
 		if !c.system.RunnerActive() {
+			if jobSince.IsZero() && c.system.TookTask() {
+				// A job that ran between two looks: its CPU use at the start is unknown.
+				jobSince, c.jobSince, c.cpuOK = lastLook, lastLook, false
+			}
 			break
 		}
+		lastLook = c.now()
 		now := c.now()
 		if jobSince.IsZero() && c.system.Busy() {
 			jobSince = now
@@ -268,8 +293,74 @@ func (c *Cycle) Serve(a provider.Parsed) bool {
 // not the job's.
 func (c *Cycle) jobStarted() {
 	usage, pressure, ok := c.system.CPU()
-	c.cpuAtJob, c.cpuOK = [2]int64{usage, pressure}, ok
+	c.cpuAtJob, c.cpuOK, c.jobSince = [2]int64{usage, pressure}, ok, c.now()
 	c.setState(provider.Running)
+}
+
+// savedState is what a cycle keeps of itself in its state file to resume.
+type savedState struct {
+	Assignment    string             `json:"assignment"`
+	Last          *provider.Finished `json:"last"`
+	Jobs          int                `json:"jobs"`
+	Resets        int                `json:"resets"`
+	ServedSince   int64              `json:"served_since"`
+	JobSince      int64              `json:"job_since"`
+	UnusedMinutes float64            `json:"unused_minutes"`
+	CPUAtJob      [2]int64           `json:"cpu_at_job"`
+	CPUOK         bool               `json:"cpu_ok"`
+}
+
+// Resume reads what the slot's last cycle left in its state file: the last finished
+// assignment, which the broker may not have read yet, and the assignment it served. A runner
+// still active is watched to its job's end; one that ended while no cycle watched is
+// finished as it was (its job's time then includes the time without a cycle). False when the
+// runner failed.
+func (c *Cycle) Resume() bool {
+	var old savedState
+	data, err := os.ReadFile(c.settings.path(".json"))
+	if err != nil || json.Unmarshal(data, &old) != nil {
+		return true
+	}
+	if old.Last != nil {
+		c.last = old.Last
+	}
+	c.jobs, c.resets = old.Jobs, old.Resets
+	if !provider.AssignmentID.MatchString(old.Assignment) {
+		return true
+	}
+	a := provider.Parsed{ID: old.Assignment, UnusedMinutes: old.UnusedMinutes}
+	if a.UnusedMinutes <= 0 {
+		a.UnusedMinutes = 15
+	}
+	served, jobSince := c.now(), time.Time{}
+	if old.ServedSince > 0 {
+		served = time.Unix(old.ServedSince, 0)
+	}
+	if old.JobSince > 0 {
+		jobSince = time.Unix(old.JobSince, 0)
+	}
+	c.cpuAtJob, c.cpuOK = old.CPUAtJob, old.CPUOK
+	c.assignment = a.ID
+	if c.system.RunnerActive() {
+		c.log.Info("took its runner up again", "assignment", a.ID, "running", !jobSince.IsZero())
+		if jobSince.IsZero() {
+			c.setState(provider.Assigned)
+		} else {
+			c.setState(provider.Running)
+		}
+		return c.watch(a, served, jobSince)
+	}
+	if jobSince.IsZero() && c.system.TookTask() {
+		jobSince = served
+	}
+	c.log.Info("its runner ended while no cycle watched it", "assignment", a.ID)
+	c.system.SaveJournal()
+	c.finish(a, jobSince, c.now())
+	if !jobSince.IsZero() {
+		c.jobs++
+		c.write()
+	}
+	return true
 }
 
 // finish notes for the broker what the assignment's runner did: its task and the memory
@@ -290,7 +381,7 @@ func (c *Cycle) finish(a provider.Parsed, jobSince, ended time.Time) {
 		c.log.Info("finished without a job", "assignment", a.ID)
 	}
 	c.last = last
-	c.assignment = ""
+	c.assignment, c.servedSince, c.jobSince = "", time.Time{}, time.Time{}
 	c.write()
 }
 
@@ -330,6 +421,11 @@ func (c *Cycle) write() {
 		"last_reset_at":      unix(c.lastResetAt),
 		"assignment":         c.assignment,
 		"last":               c.last,
+		"served_since":       unix(c.servedSince),
+		"job_since":          unix(c.jobSince),
+		"unused_minutes":     c.unusedMinutes,
+		"cpu_at_job":         c.cpuAtJob,
+		"cpu_ok":             c.cpuOK,
 	}
 	data, _ := json.MarshalIndent(state, "", "  ")
 	if err := replace(s.path(".json"), append(data, '\n')); err != nil {
