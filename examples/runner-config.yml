@@ -1,0 +1,13 @@
+# The runner's configuration template (config_template of a slot): the cycle fills in the
+# assigned runner's UUID and labels; the token is read from the file it writes.
+log:
+  level: info
+runner:
+  capacity: 1
+  labels: @@RUNNER_LABELS@@
+server:
+  connections:
+    forgejo:
+      url: https://forgejo.example.org
+      uuid: @@RUNNER_UUID@@
+      token_url: file:///etc/forgejo-runner/token

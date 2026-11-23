@@ -1,0 +1,32 @@
+# /etc/forgejo-berth/slots/ci-a.yml on a CI host: one Incus container slot, reset from its
+# snapshot before every job by forgejo-berth cycle ci-a.
+container: ci-a
+snapshot: clean
+# The runner's configuration, with @@RUNNER_UUID@@ and @@RUNNER_LABELS@@ (a JSON list),
+# written to config_path in the container with the assigned runner's token at token_path.
+config_template: /etc/forgejo-berth/slots/ci-a.config.yml
+config_path: /etc/forgejo-runner/config.yml
+token_path: /etc/forgejo-runner/token
+# A unit running `forgejo-runner one-job` in the container, as runner_user.
+runner_service: forgejo-runner
+runner_user: runner
+work_dir: /var/lib/forgejo-runner/work
+# Per class, the label names the broker may send and the runner label each becomes: a shared
+# runner never gets a trusted label, whatever it is sent.
+labels:
+  trusted:
+    ubuntu-latest: ubuntu-latest:host
+    docker: docker:docker://node:24-trixie
+  shared:
+    docker: docker:docker://node:24-trixie
+# Per class, the Incus volume attached at cache_path (optional).
+cache_volumes:
+  trusted: ci-cache-trusted
+  shared: ci-cache-shared
+cache_pool: default
+cache_path: /var/cache/forgejo-runner
+idle_hours: 24
+job_hours: 4
+boot_timeout: 300
+state_dir: /run/forgejo-berth
+textfile_dir: /var/lib/node_exporter/textfile

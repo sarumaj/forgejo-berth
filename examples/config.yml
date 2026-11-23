@@ -1,0 +1,69 @@
+# forgejo-berth run --config /etc/forgejo-berth/config.yml
+# Secret paths without a leading slash are looked up in $CREDENTIALS_DIRECTORY (systemd's
+# LoadCredential) when that is set.
+forgejo:
+  url: https://forgejo.example.org
+  # A token of an admin with write:admin and read:repository.
+  admin_token_file: admin.token
+
+# Owners whose jobs get runners at their own user scope (a token of theirs with write:user),
+# with labels everyone else's jobs may not ask for, such as host-mode execution.
+trusted:
+  owners:
+    alice: alice.token
+  labels: [ubuntu-latest, docker]
+
+# Everyone else's jobs get global runners with these labels only.
+shared:
+  labels: [docker]
+
+hosts:
+  - name: ci-1
+    address: ci-1.example.org
+    # What the jobs of its slots may use together: the containers' memory, less the host's.
+    memory_mib: 14000
+    # For the optional CPU admission (cpu.overcommit), and a cap on its concurrent jobs.
+    cpu_cores: 8
+    max_jobs: 3
+  - name: ci-2
+    address: ci-2.example.org
+    memory_mib: 6000
+    # Labels only this host offers; a job asking for one goes here only.
+    features: [gpu]
+    cpu_cores: 4
+
+provider:
+  type: ssh
+  ssh:
+    user: berth
+    port: 22
+    key_file: ssh_key
+    known_hosts_file: /etc/forgejo-berth/known_hosts
+    control_dir: /run/forgejo-berth
+
+estimate:
+  history_runs: 5
+  spike_days: 30
+  margin: 1.2
+  relative_margin: 1.5
+  floor_mib: 512
+  unknown_mib: 6144
+  retention_days: 180
+
+# Every job's CPU use is recorded; with overcommit above 0, a busy host takes a job only while
+# its jobs' predicted cores stay within cpu_cores times overcommit.
+cpu:
+  overcommit: 0
+  unknown_cores: 1
+
+history:
+  path: /var/lib/forgejo-berth/history.sqlite
+
+interval_seconds: 10
+unused_minutes: 15
+starve_minutes: 10
+runner_prefix: berth-
+listen: 127.0.0.1:9877
+log:
+  format: text
+  level: info
