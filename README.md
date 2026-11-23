@@ -443,7 +443,8 @@ scripts/dist.sh v0.1.0   # the release archives and checksums.txt in dist/
 Docker (rootless works), with slots that are runner containers: two owners' workflows run, the
 broker learns their peaks and CPU use, and the next build reserves its own peak with the margin.
 `scripts/real-forgejo.sh docker` runs the same through the docker provider, each job's
-containers in a Docker of its slot's own.
+containers in a Docker of its slot's own, each slot with a cache volume of its own and one slot
+paused throughout.
 
 ## Licence
 

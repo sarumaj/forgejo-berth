@@ -728,7 +728,10 @@ runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
   slot side run in the broker and the cycle's resume too.
 - The incus provider is tested against a fake Incus API (HTTPS with client certificates,
   built from the REST API's documented shapes): a slot's whole life, failed operations, the
-  pinned server certificate. It is not tested against a real Incus server yet.
+  pinned server certificate (a host's own too), the cache volumes made at their first use, the
+  runner's journal in the log. It is not tested against a real Incus server yet.
 - The docker provider is tested against a fake Engine API on a unix socket, and end to end by
   `scripts/real-forgejo.sh docker`: a real Forgejo, the provider on the engine the test runs
-  on, real jobs in each slot's own Docker, learned and packed by their peaks.
+  on, real jobs in each slot's own Docker, learned and packed by their peaks; each slot with a
+  cache volume of its own, made at its first use, and one slot paused throughout, which runs
+  no job and is ready once resumed.

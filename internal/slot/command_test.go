@@ -198,3 +198,13 @@ func TestPauseAndResume(t *testing.T) {
 		t.Fatalf("assign after the resume = %d %s", code, out)
 	}
 }
+
+func TestTheSlotExampleIsValid(t *testing.T) {
+	s, err := LoadSettings("../../examples/slot.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CacheVolumes["shared"] != "ci-cache-ci-a-shared" {
+		t.Fatalf("volumes %v", s.CacheVolumes)
+	}
+}
