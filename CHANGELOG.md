@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The release bot
 writes each version's section from the commits (Conventional Commits) and the hand-written
 Unreleased section.
 
+## 0.3.0 - 2026-11-24
+
+### Added
+
+- pause and resume a single slot
+- the cycles the broker runs have their metrics in the broker's
+- cache volumes of each slot's own, made at their first use
+- per-host TLS, runner configuration template and label tables
+
+### Fixed
+
+- the runner's journal of an incus slot is in the broker's log at info
+- a slot request after -- is never taken for a flag
+
 ## 0.2.1 - 2026-11-23
 
 ### Fixed
