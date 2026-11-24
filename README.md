@@ -444,7 +444,9 @@ Docker (rootless works), with slots that are runner containers: two owners' work
 broker learns their peaks and CPU use, and the next build reserves its own peak with the margin.
 `scripts/real-forgejo.sh docker` runs the same through the docker provider, each job's
 containers in a Docker of its slot's own, each slot with a cache volume of its own and one slot
-paused throughout.
+paused throughout. `scripts/real-forgejo.sh incus` runs it through the incus provider against a
+real Incus, which runs in a privileged container of the same engine (see
+[docs/design.md](docs/design.md#testing) for what it covers and needs).
 
 ## Licence
 

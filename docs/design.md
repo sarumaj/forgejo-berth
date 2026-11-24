@@ -729,9 +729,64 @@ runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
 - The incus provider is tested against a fake Incus API (HTTPS with client certificates,
   built from the REST API's documented shapes): a slot's whole life, failed operations, the
   pinned server certificate (a host's own too), the cache volumes made at their first use, the
-  runner's journal in the log. It is not tested against a real Incus server yet.
+  runner's journal in the log; and end to end by `scripts/real-forgejo.sh incus`, below.
 - The docker provider is tested against a fake Engine API on a unix socket, and end to end by
   `scripts/real-forgejo.sh docker`: a real Forgejo, the provider on the engine the test runs
   on, real jobs in each slot's own Docker, learned and packed by their peaks; each slot with a
   cache volume of its own, made at its first use, and one slot paused throughout, which runs
   no job and is ready once resumed.
+
+### The incus end-to-end run
+
+`scripts/real-forgejo.sh incus` runs the scenario through the incus provider against a real
+Incus, with real Forgejo jobs:
+
+```mermaid
+flowchart LR
+  test["go test (the broker)"] -- "HTTPS :8443, client certificate" --> incusd
+  test -- "unix socket (a ping)" --> incusd
+  subgraph host["privileged Docker container: the Incus host"]
+    incusd["Incus"] --> a["container a"]
+    incusd --> b["container b"]
+  end
+  a -- "forgejo-runner one-job" --> forgejo["Forgejo (Docker)"]
+  b -- "forgejo-runner one-job" --> forgejo
+```
+
+- **Set up** (`e2e/real/incus/`): a Debian container (`INCUS_HOST_IMAGE`) installs Incus,
+  initialises it (`dir` storage, a bridge) and listens on `:8443`, published on
+  `127.0.0.1:INCUS_PORT`. Slots `a` and `b` are Debian 13 containers with forgejo-runner (the
+  runner image's binary) as the systemd service `forgejo-runner`, run as `runner`, and a
+  snapshot `clean` taken after the setup, in the project `INCUS_PROJECT` (`default`; another
+  is made with the default project's profiles and images). The broker's client certificate is
+  trusted restricted to that project; the server's own certificate is pinned (`tls.ca_file`),
+  though the test reaches it at an address its certificate does not name.
+- **Checked**: the jobs pass; the builds' peaks are learned and not 0, and their CPU use; the
+  second build reserves its learned peak; each slot's cache volumes (`{host}-{slot}`) are made
+  at their first use and keep a build's file across the slot's resets; `forgejo-berth pause`
+  holds slot `b` out of service after the first round (it runs nothing more, `paused` in the
+  broker's metrics with the cycles' other series) and `forgejo-berth resume` makes it ready
+  again; the runners' journals are in the broker's log at info; the local socket answers.
+- **Needs** an engine that grants `--privileged` with cgroup v2 and the `cpu`, `memory` and
+  `pids` controllers delegated (rootless Docker with systemd's delegation works), and
+  `images:debian/13` from the network. No KVM: containers only, no virtual machine slots.
+
+What the harness changes from a production host, and why:
+
+- The slot containers are privileged (`security.privileged`): a rootless engine's container has
+  65536 ids of its own, too few to give an unprivileged Incus container a map of its own.
+- `raw.lxc: lxc.apparmor.profile=unchanged`: where the engine confines its containers with
+  AppArmor (as rootless Docker's rootlesskit is), LXC cannot switch to a profile of its own
+  (`Already AppArmor confined, but new label requested`), and keeps the one it is in.
+- Memory accounting: cgroup v2 enables a controller for a cgroup's children only while the
+  cgroup holds no processes. LXC puts a container beside PID 1's cgroup (a trailing
+  `init.scope` pruned), so the host's entrypoint moves itself to `init.scope`, Incus to a leaf
+  of its own, and enables the controllers in the emptied root. Without that a container has no
+  memory controller, no `memory.peak`, and every peak would be 0.
+- Incus 6.0 (the LTS) reports no `memory.usage_peak` on cgroup v2: the peaks come from the
+  container's own `memory.peak`, read from inside (the provider's fallback). The state's peak
+  is used where a server reports it.
+- The containers resolve Forgejo through `/etc/hosts` (written before the snapshot): Incus'
+  DNS does not know the Docker network's names.
+- LXC logs `Failed to load bpf program` (no device cgroup filter in a nested container); it is
+  not fatal.

@@ -78,7 +78,7 @@ provider:
 			}
 			hosted = h
 			return h
-		})
+		}, nil)
 
 	cycles := map[string]provider.CycleStats{}
 	jobs := 0
