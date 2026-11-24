@@ -24,8 +24,9 @@ Engine API or the Incus API). The design is
   `Instance`: the `incus` command here, the API in `provider/incus`), and `Local`, the
   slot side run in the broker for the providers that need nothing on the host.
 - `e2e/`: the broker against a fake Forgejo API and an in-memory provider; `e2e/real/` (build
-  tag `realforgejo`, run by `scripts/real-forgejo.sh [docker]`) against a real Forgejo and
-  runner in Docker, the second through the docker provider.
+  tag `realforgejo`, run by `scripts/real-forgejo.sh [docker|incus]`) against a real Forgejo and
+  runner in Docker, the second through the docker provider, the third through the incus
+  provider on a real Incus in a privileged container (`e2e/real/incus/`).
 - `examples/`: configuration, slot settings, units. `scripts/`: the release build.
 
 ## Rules

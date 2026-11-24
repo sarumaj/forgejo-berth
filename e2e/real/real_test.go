@@ -253,7 +253,8 @@ func push(t *testing.T, base, token, repo, path, content string) {
 }
 
 // The workflows: a build that holds about 300 MiB, a matrix on docker, and another owner's
-// job (a global runner).
+// job (a global runner). The build first waits longer than a slot's look, so its cycle sees
+// it running and measures its CPU use from there.
 const appWorkflow = `on: [push]
 defaults:
   run:
@@ -262,7 +263,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - run: sleep 12
       - run: head -c 300000000 /dev/zero | tail > /dev/null; i=0; while [ $i -lt 2000000 ]; do i=$((i+1)); done
+      # A line in the slot's cache volume, where the runner has one (incus): it outlives the
+      # slot's reset.
+      - run: d=/var/cache/forgejo-runner; if [ -w "$d" ]; then echo build >> "$d/builds"; fi
   test:
     runs-on: docker
     strategy:
@@ -295,24 +300,32 @@ func TestRealForgejo(t *testing.T) {
 		}
 	}()
 	scenario(t, "hosts: [{name: ci-1, address: localhost, memory_mib: 4000}]\n",
-		func(*config.Config, *slog.Logger) provider.Provider { return slots })
+		func(*config.Config, *slog.Logger) provider.Provider { return slots }, nil)
 }
 
 // scenario runs two owners' workflows through the broker with the provider: the broker
 // learns their peaks and CPU use, and the next build reserves its own peak with the margin.
-func scenario(t *testing.T, hosts string, slots func(*config.Config, *slog.Logger) provider.Provider) {
+// between (when set) runs after the first round, with the configuration's file. It returns
+// the broker and its log.
+func scenario(t *testing.T, hosts string, slots func(*config.Config, *slog.Logger) provider.Provider,
+	between func(configFile string)) (*broker.Broker, string) {
 	base := env(t, "BERTH_REAL_URL")
 	adminFile := env(t, "BERTH_REAL_ADMIN_TOKEN_FILE")
 	aliceFile := env(t, "BERTH_REAL_ALICE_TOKEN_FILE")
 	dir := t.TempDir()
-	cfg, err := config.Parse([]byte(fmt.Sprintf(`
+	text := fmt.Sprintf(`
 forgejo: {url: %s, admin_token_file: %s}
 trusted: {owners: {alice: %s}, labels: [ubuntu-latest, docker]}
 shared: {labels: [docker]}
 estimate: {unknown_mib: 1500}
 interval_seconds: 2
 history: {path: %s}
-`, base, adminFile, aliceFile, filepath.Join(dir, "history.sqlite")) + hosts))
+`, base, adminFile, aliceFile, filepath.Join(dir, "history.sqlite")) + hosts
+	configFile := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configFile, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(text))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,6 +378,9 @@ history: {path: %s}
 	}
 	cores, _, found, _ := hist.EstimateCores("alice/app", "build", "build", 0, 5)
 	t.Logf("learned: build %d MiB, %.2f cores (found %v)", peak, cores, found)
+	if between != nil {
+		between(configFile)
+	}
 
 	// Again: the build now reserves its own peak with the margin.
 	push(t, base, alice, "alice/app", "again.txt", "again\n")
@@ -397,4 +413,5 @@ history: {path: %s}
 			t.Fatal("a token is in the log")
 		}
 	}
+	return b, logs.String()
 }
