@@ -5,20 +5,27 @@
 package real
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"git.ciepiela.org/dawid/forgejo-berth/internal/config"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
 	dockerprovider "git.ciepiela.org/dawid/forgejo-berth/internal/provider/docker"
+	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 )
 
 // TestRealForgejoDocker runs the scenario through the docker provider on the engine the
 // test's Forgejo runs on: each job gets a runner container and a Docker of its own, whose
-// containers run the job (scripts/real-forgejo.sh docker).
+// containers run the job (scripts/real-forgejo.sh docker). Each slot has a cache volume of
+// its own, and slot c is paused throughout: it runs none of the jobs, and is ready once
+// resumed.
 func TestRealForgejoDocker(t *testing.T) {
 	address := env(t, "BERTH_REAL_DOCKER_HOST")
 	network := env(t, "BERTH_REAL_NETWORK")
@@ -43,6 +50,13 @@ func TestRealForgejoDocker(t *testing.T) {
 	if jobImage == "docker://" {
 		jobImage = "docker://docker.io/library/alpine:3"
 	}
+	// Paused before the broker starts, as a pause survives its restarts.
+	if err := os.MkdirAll(filepath.Join(state, "real-e2e"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "real-e2e", "c.pause"), []byte("finish\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	scenario(t, fmt.Sprintf(`hosts: [{name: real-e2e, address: %q, memory_mib: 4000, slots: [a, b, c]}]
 provider:
   type: docker
@@ -52,6 +66,7 @@ provider:
     network: %s
     state_dir: %s
     boot_timeout: 120
+    cache_volumes: {trusted: "berth-e2e-cache-{host}-{slot}-trusted", shared: "berth-e2e-cache-{host}-{slot}-shared"}
     labels:
       trusted: {ubuntu-latest: "ubuntu-latest:%s", docker: "docker:%s"}
       shared: {docker: "docker:%s"}
@@ -64,4 +79,50 @@ provider:
 			hosted = h
 			return h
 		})
+
+	cycles := map[string]provider.CycleStats{}
+	jobs := 0
+	for _, c := range hosted.(slot.Hosted).Cycles() {
+		cycles[c.Container] = c
+		jobs += c.Jobs
+	}
+	if c := cycles["c"]; c.State != provider.Paused || c.Jobs != 0 || jobs < 7 {
+		t.Fatalf("cycles %+v", cycles)
+	}
+	out, err := docker("volume", "ls", "-q", "--filter", "label="+dockerprovider.LabelCache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumes := strings.Fields(out)
+	for _, v := range volumes {
+		if strings.Contains(v, "-real-e2e-c-") {
+			t.Fatalf("the paused slot got a cache volume: %v", volumes)
+		}
+	}
+	if !slices.Contains(volumes, "berth-e2e-cache-real-e2e-a-trusted") &&
+		!slices.Contains(volumes, "berth-e2e-cache-real-e2e-b-trusted") {
+		t.Fatalf("no slot's own cache volume: %v", volumes)
+	}
+	t.Logf("cycles %+v, cache volumes %v", cycles, volumes)
+
+	// Resumed: the slot is reset and ready.
+	if _, err := hosted.(slot.Hosted).Resume(context.Background(), config.Host{Name: "real-e2e"}, "c"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		state := ""
+		for _, c := range hosted.(slot.Hosted).Cycles() {
+			if c.Container == "c" {
+				state = c.State
+			}
+		}
+		if state == provider.Ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the resumed slot is %s", state)
+		}
+		time.Sleep(time.Second)
+	}
 }

@@ -165,3 +165,125 @@ func TestTheProviderExamplesAreValid(t *testing.T) {
 		}
 	}
 }
+
+const incusHosts = `
+forgejo: {url: https://forgejo.example.org, admin_token_file: admin.token}
+shared: {labels: [docker]}
+trusted: {labels: [docker, ubuntu-latest]}
+history: {path: /srv/berth/history.sqlite}
+hosts:
+  - {name: ci-1, address: "https://ci-1.example.org:8443", memory_mib: 8000, slots: [a]}
+  - name: ci-2
+    address: "https://ci-2.example.org:8443"
+    memory_mib: 8000
+    slots: [a]
+    tls: {ca_file: /etc/berth/ci-2.crt}
+    config_template: /etc/berth/ci-2.yml
+    labels: {trusted: {ubuntu-latest: "ubuntu-latest:host"}}
+`
+
+func TestPerHostSettings(t *testing.T) {
+	c, err := Parse([]byte(incusHosts + `
+provider:
+  type: incus
+  incus:
+    config_template: /etc/berth/runner.yml
+    tls: {ca_file: /etc/berth/server.crt, cert_file: /etc/berth/broker.crt, key_file: broker.key}
+    labels:
+      trusted: {docker: "docker:docker://node:24"}
+      shared: {docker: "docker:docker://node:24"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, two := c.Hosts[0], c.Hosts[1]
+	if got := c.HostTLS(one); got != c.Provider.Incus.TLS {
+		t.Fatalf("ci-1's TLS %+v", got)
+	}
+	if got := c.HostTLS(two); got.CAFile != "/etc/berth/ci-2.crt" || got.CertFile != "/etc/berth/broker.crt" ||
+		got.KeyFile != "broker.key" {
+		t.Fatalf("ci-2's TLS %+v", got)
+	}
+	if s := c.HostSlots(one); s.ConfigTemplate != "/etc/berth/runner.yml" || s.Labels["trusted"]["docker"] == "" {
+		t.Fatalf("ci-1's slots %+v", s)
+	}
+	s := c.HostSlots(two)
+	if s.ConfigTemplate != "/etc/berth/ci-2.yml" || s.Labels["trusted"]["docker"] != "" ||
+		s.Labels["trusted"]["ubuntu-latest"] != "ubuntu-latest:host" || s.Labels["shared"]["docker"] == "" {
+		t.Fatalf("ci-2's slots %+v", s)
+	}
+	if c.Provider.Incus.Labels["trusted"]["ubuntu-latest"] != "" {
+		t.Fatal("a host's labels changed the provider's")
+	}
+
+	// Without the provider's template, each host needs its own.
+	_, err = Parse([]byte(incusHosts + `
+provider:
+  type: incus
+  incus:
+    tls: {cert_file: /etc/berth/broker.crt, key_file: broker.key}
+    labels: {shared: {docker: d}}
+`))
+	if err == nil || !strings.Contains(err.Error(), "hosts[0].config_template") || strings.Contains(err.Error(), "hosts[1]") {
+		t.Fatalf("a host without a template: %v", err)
+	}
+	for _, tc := range []struct{ name, hosts, provider, want string }{
+		{"a host's class not known", strings.Replace(incusHosts, "{trusted: {ubuntu", "{root: {ubuntu", 1),
+			"{type: incus, incus: {config_template: x, tls: {cert_file: c, key_file: k}, labels: {shared: {docker: d}}}}",
+			"hosts[1].labels: the classes"},
+		{"a host's TLS without the client certificate", incusHosts,
+			"{type: incus, incus: {config_template: x, labels: {shared: {docker: d}}}}", "hosts[1] (ci-2): tls"},
+		{"no labels anywhere", strings.Replace(incusHosts, "labels: {trusted: {ubuntu-latest: \"ubuntu-latest:host\"}}", "", 1),
+			"{type: incus, incus: {config_template: x, tls: {cert_file: c, key_file: k}}}", "names no class"},
+		{"an SSH host's TLS", strings.ReplaceAll(strings.ReplaceAll(incusHosts, ", slots: [a]", ""),
+			"    slots: [a]\n", ""), "{type: ssh}", "hosts[1]: tls, config_template and labels"},
+		{"a typo in a host's TLS", strings.Replace(incusHosts, "ca_file: /etc", "cafile: /etc", 1),
+			"{type: incus, incus: {config_template: x, tls: {cert_file: c, key_file: k}, labels: {shared: {docker: d}}}}",
+			"cafile"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.hosts + "provider: " + tc.provider + "\n"))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %v, want one about %s", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAHostsTLSForADockerEngine(t *testing.T) {
+	text := strings.Replace(dockerHosts, `address: "unix:///run/docker.sock"`,
+		`address: "tcp://ci-1.example.org:2376", tls: {ca_file: ca.pem, cert_file: c.pem, key_file: k.pem}`, 1)
+	c, err := Parse([]byte(text + "provider: {type: docker, docker: {labels: {shared: {docker: d}}}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.HostTLS(c.Hosts[0]); got.CAFile != "ca.pem" || got.KeyFile != "k.pem" {
+		t.Fatalf("TLS %+v", got)
+	}
+}
+
+func TestCacheVolumesOfEachSlot(t *testing.T) {
+	c, err := Parse([]byte(dockerHosts + `provider:
+  type: docker
+  docker:
+    labels: {shared: {docker: d}}
+    cache_volumes: {shared: "cache-{host}-{slot}", trusted: cache-trusted}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ExpandVolume(c.Provider.Docker.CacheVolumes["shared"], "local", "b"); got != "cache-local-b" {
+		t.Fatalf("expanded %q", got)
+	}
+	for _, tc := range []struct{ volume, want string }{
+		{"cache-{class}", "placeholders"},
+		{"cache {slot}", "letters, digits"},
+		{"{slot}/x", "letters, digits"},
+	} {
+		_, err := Parse([]byte(dockerHosts + "provider: {type: docker, docker: {labels: {shared: {docker: d}}, " +
+			"cache_volumes: {shared: \"" + tc.volume + "\"}}}\n"))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want one about %s", tc.volume, err, tc.want)
+		}
+	}
+}

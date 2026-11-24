@@ -135,8 +135,9 @@ Put `forgejo-berth` on every CI host too.
 **On each CI host** (Incus):
 
 1. Make the containers: each runs `forgejo-runner one-job` as a systemd unit, the runner's
-   configuration written from a template (see [examples/runner-config.yml](examples/runner-config.yml)).
-   Snapshot each one clean (`incus snapshot create ci-a clean`).
+   configuration written from a template (see
+   [examples/runner-config.yml](examples/runner-config.yml)). Snapshot each one clean (`incus
+   snapshot create ci-a clean`).
 2. Write a slot file per container into `/etc/forgejo-berth/slots/`
    ([examples/slot.yml](examples/slot.yml)) and start
    `forgejo-berth-cycle@<container>.service`
@@ -144,7 +145,7 @@ Put `forgejo-berth` on every CI host too.
 3. Add an account (here `berth`) whose one key is the broker's, forced to the slot command:
 
    ```text
-   restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA… forgejo-berth
+   restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot -- \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA… forgejo-berth
    ```
 
    and let it run that command as root ([examples/sudoers](examples/sudoers)).
@@ -180,6 +181,9 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `hosts[].cpu_cores`               | 0                                       | its cores, for `cpu.overcommit`                                                         |
 | `hosts[].max_jobs`                | 0 (no cap)                              | jobs at once                                                                            |
 | `hosts[].slots`                   | required for `docker`, `incus`          | the slots' names (Incus: the containers'); an SSH host lists its own                    |
+| `hosts[].tls`                     | the provider's                          | its own `ca_file`, `cert_file`, `key_file` (`docker`, `incus`)                          |
+| `hosts[].config_template`         | the provider's                          | its own runner configuration template (`docker`, `incus`)                               |
+| `hosts[].labels`                  | the provider's                          | per class, its own label table (`docker`, `incus`)                                      |
 | `provider.type`                   | `ssh`                                   | `ssh`, `docker` or `incus`                                                              |
 | `provider.ssh.user`               | `berth`                                 | the CI hosts' account                                                                   |
 | `provider.ssh.port`               | 22                                      |                                                                                         |
@@ -197,7 +201,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.docker.network`         | the engine's default                    | a network the runner and its Docker join                                                |
 | `provider.docker.labels`          | required                                | per class, label name to runner label                                                   |
 | `provider.docker.config_template` | none                                    | the runner's configuration, with `@@RUNNER_UUID@@`, `@@RUNNER_LABELS@@`                 |
-| `provider.docker.cache_volumes`   | none                                    | per class, a volume mounted at `cache_path`                                             |
+| `provider.docker.cache_volumes`   | none                                    | per class, a volume at `cache_path`; `{host}`, `{slot}`: [each slot's](#cache-volumes)  |
 | `provider.docker.cache_path`      | `/var/cache/forgejo-runner`             |                                                                                         |
 | `provider.docker.tls`             | none                                    | `ca_file`, `cert_file`, `key_file`: required for `tcp://` engines                       |
 | `provider.docker.state_dir`       | `slots/` beside the history             | the slots' state, per host                                                              |
@@ -208,7 +212,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.incus.tls`              | none                                    | `ca_file` (the server's certificate, pinned, or a CA), `cert_file`, `key_file`          |
 | `provider.incus.project`          | `default`                               | the containers' project                                                                 |
 | `provider.incus.snapshot`         | `clean`                                 | restored before every job                                                               |
-| `provider.incus.config_template`  | required                                | the runner's configuration, on the broker's host                                        |
+| `provider.incus.config_template`  | required (or every host's)              | the runner's configuration, on the broker's host                                        |
 | `provider.incus.config_path`      | `/etc/forgejo-runner/config.yml`        | as in a slot file ([examples/slot.yml](examples/slot.yml))                              |
 | `provider.incus.token_path`       | `/etc/forgejo-runner/token`             | as in a slot file                                                                       |
 | `provider.incus.runner_service`   | `forgejo-runner`                        | as in a slot file                                                                       |
@@ -216,7 +220,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.incus.work_dir`         | `/var/lib/forgejo-runner/work`          | as in a slot file                                                                       |
 | `provider.incus.cache_pool`       | `default`                               | as in a slot file                                                                       |
 | `provider.incus.labels`           | required                                | as for `docker`                                                                         |
-| `provider.incus.cache_volumes`    | none                                    | per class, an Incus volume attached at `cache_path`                                     |
+| `provider.incus.cache_volumes`    | none                                    | per class, an Incus volume at `cache_path`; as for `docker`                             |
 | `provider.incus.…`                | as for `docker`                         | `cache_path`, `state_dir`, `idle_hours`, `job_hours`, `boot_timeout`, `timeout_seconds` |
 | `estimate.history_runs`           | 5                                       | the last runs that count                                                                |
 | `estimate.spike_days`             | 30                                      | runs within that many days count too                                                    |
@@ -246,8 +250,9 @@ the largest seen; an underestimate is learned at once and counted.
 
 With the `docker` provider, a host is a Docker Engine: `unix:///path` (the broker's host), or
 `tcp://host:2376` with TLS and a client certificate (`provider.docker.tls`, the key a secret
-file). The slots' reset cycles run in the broker; their state is in `state_dir`, so a restart
-of the broker leaves running jobs alone and takes them up again. For each job, a slot makes:
+file; a host's own `tls` in place of any of its files). The slots' reset cycles run in the
+broker; their state is in `state_dir`, so a restart of the broker leaves running jobs alone and
+takes them up again. For each job, a slot makes:
 
 - `<runner_prefix><host>-<slot>`: the runner's container, from `image`, running
   `forgejo-runner one-job` for the assigned runner (its token in a file of the container,
@@ -285,25 +290,55 @@ What a job can reach depends on `job_engine`:
 
 With the `incus` provider, a host is an Incus server: `https://host:8443` with the broker's
 client certificate (the server's own certificate in `tls.ca_file` is pinned: it must present
-exactly that one), or `unix:///var/lib/incus/unix.socket`. A slot is a container of
-`hosts[].slots`, as with the SSH provider; its reset cycle runs in the broker and does the same
-through the API: stop, restore the snapshot, start, wait for systemd; attach the class's cache
-volume, push the runner's configuration and token through the file API, start the runner;
-watch it with `exec` (its cgroup seen from inside); after the job, the peak from the
-instance's state (`memory.usage_peak` plus `swap_usage_peak`; the container's own
-`memory.peak` where the server reports none), the CPU from its cgroup. The state is in
-`state_dir`, as for Docker. The runner's journal is in the broker's log at debug level.
+exactly that one; a server with a certificate of its own has it in its host's `tls.ca_file`), or
+`unix:///var/lib/incus/unix.socket`. A slot is a container of `hosts[].slots`, as with the SSH
+provider; its reset cycle runs in the broker and does the same through the API: stop, restore
+the snapshot, start, wait for systemd; attach the class's cache volume, push the runner's
+configuration and token through the file API, start the runner; watch it with `exec` (its cgroup
+seen from inside); after the job, the peak from the instance's state (`memory.usage_peak` plus
+`swap_usage_peak`; the container's own `memory.peak` where the server reports none), the CPU
+from its cgroup. The state is in `state_dir`, as for Docker. After each runner, its journal is
+in the broker's log, a record (`msg=runner`) per line at info, as an SSH host's cycle has it in
+its own; at warn when the runner failed (it did not start, or exited at once without a job),
+so that the reason is there without debug logging. A Docker slot's runner log is one record, at
+debug, or at warn when the runner failed.
+
+## Cache volumes
+
+`cache_volumes` gives the runner a volume at `cache_path` that outlives the slot's reset, per
+class (`trusted`, `shared`): the runner's caches (its `actions/cache` server's store, set in its
+configuration) then last from one job to the next. A plain name is one volume for every slot of
+a host, which their jobs use at the same time. With `{slot}` (and `{host}`) in the name, each
+slot has a volume of its own:
+
+```yaml
+cache_volumes:
+  trusted: berth-cache-{host}-{slot}-trusted
+  shared: berth-cache-{host}-{slot}-shared
+```
+
+`{host}` is the host's name, `{slot}` the slot's (an Incus slot's container); in an SSH host's
+slot file, `{slot}` is the container and `{host}` the host's own short name. A volume that is not
+there is made at its first use, empty: a Docker named volume (with the labels
+`org.forgejo-berth.host` and `org.forgejo-berth.cache`, its class), or an Incus custom volume
+in `cache_pool`. berth never removes one: a slot taken out of the configuration leaves its
+volume behind, for `docker volume rm` or `incus storage volume delete`.
 
 ## Slot protocol
 
-The broker runs one of three commands over SSH; the host's key forces `forgejo-berth slot`,
-which takes the requested command as its one argument (or from `SSH_ORIGINAL_COMMAND`).
+The broker runs these commands over SSH (`pause` and `resume` for `forgejo-berth pause`); the
+host's key forces `forgejo-berth slot`, which takes the requested command as its one argument
+(or from `SSH_ORIGINAL_COMMAND`). Put `--` before the argument, as above: a request after `--`
+is never taken for a flag, whatever it begins with (without it, one beginning with `-` would be
+parsed as the command's flags).
 
-| Command                            | Input           | Output                                      |
-| ---------------------------------- | --------------- | ------------------------------------------- |
-| `status`                           | none            | JSON: the slots and their last finished job |
-| `assign <container>`               | assignment JSON | the assignment id; exit 1 when refused      |
-| `release <container> <assignment>` | none            | exit 1 when the slot does not hold it       |
+| Command                            | Input           | Output                                               |
+| ---------------------------------- | --------------- | ---------------------------------------------------- |
+| `status`                           | none            | JSON: the slots and their last finished job          |
+| `assign <container>`               | assignment JSON | the assignment id; exit 1 when refused               |
+| `release <container> <assignment>` | none            | exit 1 when the slot does not hold it                |
+| `pause <container> [stop]`         | none            | the slot's state ([Pausing a slot](#pausing-a-slot)) |
+| `resume <container>`               | none            | the slot's state                                     |
 
 ```json
 {"slots": [{"container": "ci-a", "state": "ready", "state_since": 1763700000,
@@ -318,10 +353,37 @@ which takes the requested command as its one argument (or from `SSH_ORIGINAL_COM
 ```
 
 States: `ready`, `pending` (written, not taken yet), `assigned`, `running`, `resetting`,
-`failed`, `stopped`. The class (`trusted` for owners' runners, `shared` for global ones)
-selects the slot's own label table: the slot maps label names to runner labels, so a shared
-runner never gets a trusted label, whatever it is sent. Every field's check is in
+`failed`, `stopped`, `paused`; `"paused": true` while a slot is paused or pausing. The class
+(`trusted` for owners' runners, `shared` for global ones) selects the slot's own label table:
+the slot maps label names to runner labels, so a shared runner never gets a trusted label,
+whatever it is sent. Every field's check is in
 [docs/design.md](docs/design.md#slot-protocol-ssh).
+
+## Pausing a slot
+
+A slot can be taken out of service without stopping the broker, for instance while its
+container is reconfigured:
+
+```sh
+forgejo-berth pause --config /etc/forgejo-berth/config.yml ci-1/ci-a          # after its job
+forgejo-berth pause --config /etc/forgejo-berth/config.yml --stop ci-1/ci-a   # at once
+forgejo-berth resume --config /etc/forgejo-berth/config.yml ci-1/ci-a
+```
+
+A paused slot takes no new assignment. A runner it holds that has no job yet is stopped (the
+broker starts another one elsewhere); a job it runs runs to its end, or with `--stop` is cut at
+once. Then the slot is reset as after every job and stays `paused`: an Incus container restored
+and running, untouched until it is resumed; a Docker slot without containers. Resumed, it is
+reset again (an Incus container restored from its snapshot, which may be a new one) and is
+`ready`. The slot reports `paused` in its state and in `forgejo_berth_cycle_state`.
+
+The pause is a file beside the slot's state (`<state_dir>/[<host>/]<slot>.pause`), so it
+survives a restart of the broker or of the cycle: a slot still paused is left as it is, not
+reset. With the `docker` and `incus` providers `forgejo-berth pause` writes it into the
+broker's `state_dir` (run it as the broker's user); with `ssh` it asks the host's slot command,
+which can be run on the host as well (`forgejo-berth slot -- "pause ci-a"`). An SSH host's
+default `state_dir` is under `/run`: a pause there does not survive the host's reboot unless
+`state_dir` is on disk.
 
 ## Observability
 
@@ -329,10 +391,14 @@ runner never gets a trusted label, whatever it is sent. Every field's check is i
   `forgejo_berth_host_reachable{host}`, `forgejo_berth_reserved_mib{host}`,
   `forgejo_berth_events_total{event}` (`assigned`, `learned`, `unlearned`, `unused`, `failed`,
   `underestimated`, `released`, `would_assign`), `forgejo_berth_estimates{source}`,
-  `forgejo_berth_jobs_learned`, `forgejo_berth_shadow`. The cycle writes
-  `forgejo_berth_cycle_*` to a node_exporter textfile directory when one is set.
+  `forgejo_berth_jobs_learned`, `forgejo_berth_shadow`. Each slot's reset cycle has
+  `forgejo_berth_cycle_state{container,state}`, `forgejo_berth_cycle_jobs_total{container}`,
+  `forgejo_berth_cycle_failures{container}` and `forgejo_berth_cycle_last_reset_seconds{container}`:
+  on an SSH host the cycle writes them to a node_exporter textfile directory when one is set
+  (`textfile_dir`); with the `docker` and `incus` providers they are part of the broker's
+  metrics (and `metrics_file`), with a `host` label.
 - `GET /state`: the hosts' reachability and reservations, the assignments (no tokens), the
-  counters and the estimates' sources.
+  counters and the estimates' sources, and the cycles the broker runs (`cycles`).
 - `GET /healthz`: 200 while the last look is recent.
 - Logs: structured (`log/slog`), one line per decision.
 
@@ -377,7 +443,8 @@ scripts/dist.sh v0.1.0   # the release archives and checksums.txt in dist/
 Docker (rootless works), with slots that are runner containers: two owners' workflows run, the
 broker learns their peaks and CPU use, and the next build reserves its own peak with the margin.
 `scripts/real-forgejo.sh docker` runs the same through the docker provider, each job's
-containers in a Docker of its slot's own.
+containers in a Docker of its slot's own, each slot with a cache volume of its own and one slot
+paused throughout.
 
 ## Licence
 

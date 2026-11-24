@@ -19,6 +19,8 @@ const (
 	Resetting = "resetting"
 	Failed    = "failed"
 	Stopped   = "stopped"
+	// Paused is a slot held out of service: reset, it takes no assignment until resumed.
+	Paused = "paused"
 )
 
 // Slot is a container slot as its host reports it.
@@ -36,6 +38,8 @@ type Slot struct {
 	Seconds  float64
 	// Unused is set when the finished assignment's runner took no job.
 	Unused bool
+	// Paused is set when the slot is paused or pausing (its job still running).
+	Paused bool
 	// CPUCores is the job's average CPU use in cores, CPUPressure the share of its run time
 	// some of its tasks waited for a CPU (0: not measured).
 	CPUCores    float64
@@ -70,4 +74,13 @@ type Provider interface {
 	Assign(ctx context.Context, host config.Host, container string, h Handoff) error
 	// Release asks the slot to stop the assignment's runner if it has no job yet.
 	Release(ctx context.Context, host config.Host, container, assignment string) error
+}
+
+// Pauser pauses and resumes a slot; each returns the slot's state as it is then.
+type Pauser interface {
+	// Pause keeps the slot from taking assignments, once its job ended or, with stop, at
+	// once (its job stopped).
+	Pause(ctx context.Context, host config.Host, container string, stop bool) (string, error)
+	// Resume lets the slot take assignments again, after a reset.
+	Resume(ctx context.Context, host config.Host, container string) (string, error)
 }

@@ -112,7 +112,7 @@ holds (left by a crash between registering and keeping).
 
 | Package                    | Role                                                                                                      |
 | -------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `cmd/forgejo-berth`        | subcommands `run`, `slot`, `cycle`, `check`, `version`                                                    |
+| `cmd/forgejo-berth`        | subcommands `run`, `slot`, `cycle`, `check`, `pause`, `resume`, `version`                                 |
 | `internal/config`          | the broker's YAML configuration, defaults and validation                                                  |
 | `internal/broker`          | jobs, slots, assignments; offer, predict, schedule; the loop                                              |
 | `internal/history`         | SQLite: finished runs and the assignments held across restarts                                            |
@@ -196,6 +196,7 @@ at a live instance's.
 | `resetting` | the container is being restored from its snapshot                     |
 | `failed`    | a reset or a runner start failed; the cycle backs off and tries again |
 | `stopped`   | the cycle is not running                                              |
+| `paused`    | reset and held out of service until it is resumed                     |
 
 A slot is free only when it is `ready` with no assignment and no kept assignment of the broker
 names it.
@@ -206,11 +207,13 @@ The broker runs `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i <key> -p <
 <user>@<address> <command>`. The host's `authorized_keys` forces the command, for example:
 
 ```text
-restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA…
+restrict,from="192.0.2.10",command="sudo -n /usr/local/bin/forgejo-berth slot -- \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 AAAA…
 ```
 
 `forgejo-berth slot` takes the whole requested command as one argument (or from
-`SSH_ORIGINAL_COMMAND`) and knows three commands. Anything else exits 1 with a usage line.
+`SSH_ORIGINAL_COMMAND`) and knows five commands. Anything else exits 1 with a usage line. The
+argument follows `--`, which ends the command's own flags: a request beginning with `-` is then
+a request (refused), never a flag such as `--settings-dir`.
 
 `status` prints JSON on standard output. Tokens are never part of it.
 
@@ -248,6 +251,13 @@ with an assignment already waiting, and an assignment out of shape.
 `release <container> <assignment>` asks the cycle to stop the assignment's runner if it still
 has no job. It refuses a slot that does not hold that assignment.
 
+`pause <container>` and `pause <container> stop` pause the slot (see
+[Pausing a slot](#pausing-a-slot)), `resume <container>` resumes it; each prints the slot's
+state. A paused slot's `status` entry has `"paused": true` (omitted otherwise), and `assign`
+refuses it. A broker of an older version reads neither: it sees a slot that is not `ready`.
+The broker's key may pause and resume the host's slots, which takes nothing from it that it
+could not deny by assigning nothing; `forgejo-berth pause` uses that.
+
 The host maps label *names* to runner labels by the class's own table, so a shared runner can
 never get a host label, whatever the broker sends. The broker sends names only.
 
@@ -276,7 +286,50 @@ Failures back off from 30 seconds, doubling to 10 minutes. A SIGTERM ends the lo
 step in progress and leaves the container as it is (`stopped`).
 
 The state goes to `<state_dir>/<container>.json`; the assignment to `<container>.assignment`,
-the release to `<container>.release`.
+the release to `<container>.release`, a pause to `<container>.pause`.
+
+### Pausing a slot
+
+A pause is the file `<container>.pause` beside the slot's state (written by `pause`, 0644, its
+content `finish` or `stop`; removed by `resume`). The cycle reads it at each of its looks:
+
+- **ready**: an assignment written before the pause is still taken and served (the broker
+  holds its runner); otherwise the cycle holds the slot (`paused`) at once, without a reset;
+- **assigned** (a runner without a job): the runner is stopped as for a release, unless its
+  journal shows it took a task; that is no failure of the slot (no back-off);
+- **running**: the job runs to its end; with `stop` it is cut as a job over `job_hours` is,
+  and the reset stops it;
+- **reset**: after every reset the cycle holds a paused slot instead of waiting for an
+  assignment.
+
+Held, the slot is `paused`: its container is as the reset left it (an Incus container
+restored and running; a Docker slot without containers), and the cycle does nothing but look
+for the resume. Resumed, it resets the container (an Incus container is restored from its
+snapshot, which the one who paused it may have made anew) and is `ready`.
+
+The state file notes that the cycle holds the slot (`held`). A cycle that starts while the slot
+is held and still paused (a broker or a cycle restarted) holds it again at once, without the
+reset that a start does otherwise: the container may be in the middle of its change. A slot
+paused while no cycle ran is reset at the start, then held. The pause file lives as long as
+`state_dir`: the broker's (beside the history) is on disk; an SSH host's default
+(`/run/forgejo-berth`) is not kept over the host's reboot.
+
+### Cache volumes
+
+A class's cache volume (`cache_volumes`) is attached to the slot for every job of that class
+and kept over the reset. A name with `{host}` and `{slot}` is expanded per slot (the slot side
+expands it, on the host for the SSH provider with the host's short name), so that each slot has
+a volume of its own: two jobs at once never write the same cache, and a slot's next job finds
+what the last one left. A plain name stays one volume for all slots, as before.
+
+A volume that is not there is made at the first use, rather than refused: with one volume per
+slot and class, making them all by hand is the error-prone step, and an empty cache volume is
+what a new one would be anyway. Docker: `GET /volumes/<name>`, else `POST /volumes/create` with
+the labels `org.forgejo-berth.host` and `org.forgejo-berth.cache` (a volume the mount made
+would have none). Incus: `GET /1.0/storage-pools/<pool>/volumes/custom/<name>`, else a `POST`
+of a custom file system volume in `cache_pool` (the `incus` command: `storage volume show`,
+`create`); two cycles that make the same volume at once both go on. berth removes no cache
+volume.
 
 ## Docker provider
 
@@ -343,6 +396,14 @@ reads and changes it. Two implement it:
 | peak         | the cgroup's `memory.peak`, `memory.swap.peak`   | the state's `memory.usage_peak`, `swap_usage_peak`         |
 | CPU          | the cgroup's `cpu.stat`, `cpu.pressure`          | the same files, read by `exec` from inside                 |
 
+After each runner the cycle saves the runner's journal of this boot (`journalctl --boot
+--unit=<runner_service>`, its last `journal_lines`): an SSH host's cycle prints it to its own
+output (the unit's journal), the incus provider's into the broker's log, a record per line at
+info. When the runner failed (its service did not start, or it exited within a minute without
+a job), the lines are at warn: the journal is the only account of why, and the next reset
+loses it. The docker provider logs the runner container's output as one record, at debug, at
+warn for a failed runner.
+
 Inside a container, cgroup v2 with its cgroup namespace shows the container's own cgroup at
 `/sys/fs/cgroup`, the tree the host sees under `lxc.payload.<c>`. The runner is looked at once
 for both questions of a look (active, busy). An answer that does not come (the API away for a
@@ -363,6 +424,13 @@ One YAML file, `--config` (default `/etc/forgejo-berth/config.yml`). Secrets are
 admin token, each trusted owner's token, the SSH key. A relative secret path is looked up in
 `$CREDENTIALS_DIRECTORY` when set (systemd `LoadCredential`), else in the working directory.
 The command line takes no secret. The full reference is in the README.
+
+With the `docker` and `incus` providers, the slots' settings are the provider's, the same on
+every host, but for three a host may set for itself: `tls` (a server with a certificate of its
+own to pin, or another CA; each field it sets replaces the provider's, the others are the
+provider's), `config_template` (the runner's configuration on that host) and `labels` (per
+class: a class the host lists has the host's table, the others the provider's). A configuration
+without them reads as before. An SSH host's slots have these in their slot files, on the host.
 
 ```yaml
 forgejo:
@@ -563,8 +631,24 @@ starts there until the job fits.
 
   Events: `assigned`, `learned`, `unlearned`, `unused`, `failed`, `underestimated`, `released`,
   and in shadow mode `would_assign`.
+- The reset cycles' metrics, one series per slot:
+
+  | Metric                                   | Labels                         | Kind    |
+  | ---------------------------------------- | ------------------------------ | ------- |
+  | `forgejo_berth_cycle_state`              | (`host`), `container`, `state` | gauge   |
+  | `forgejo_berth_cycle_jobs_total`         | (`host`), `container`          | counter |
+  | `forgejo_berth_cycle_failures`           | (`host`), `container`          | gauge   |
+  | `forgejo_berth_cycle_last_reset_seconds` | (`host`), `container`          | gauge   |
+
+  An SSH host's cycle writes them to `<textfile_dir>/forgejo_berth_cycle_<container>.prom`
+  for node_exporter, without `host` (node_exporter's own `instance` is the host). The cycles the
+  broker runs (`docker`, `incus`) have them in the broker's `/metrics` and `metrics_file`, read
+  from their state files at every look, with the `host` label (a slot's name is the same on
+  several hosts). `jobs_total` counts since the cycle started on an SSH host; a broker's cycle
+  resumes its count from the state file. A shadow broker runs no cycles and has none.
 - `GET /state`: JSON (`last_tick`, `waiting`, `unservable`, `hosts` with `reachable` and
-  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`). The same
+  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`, and
+  `cycles`, the broker's own cycles as their metrics show them). The same
   document can be written to `state_file` atomically, for tools that read files, and the
   metrics to `metrics_file` (a node_exporter textfile collector's `.prom` file).
 - `GET /healthz`: 200 while the last look is younger than three intervals.
@@ -644,7 +728,10 @@ runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
   slot side run in the broker and the cycle's resume too.
 - The incus provider is tested against a fake Incus API (HTTPS with client certificates,
   built from the REST API's documented shapes): a slot's whole life, failed operations, the
-  pinned server certificate. It is not tested against a real Incus server yet.
+  pinned server certificate (a host's own too), the cache volumes made at their first use, the
+  runner's journal in the log. It is not tested against a real Incus server yet.
 - The docker provider is tested against a fake Engine API on a unix socket, and end to end by
   `scripts/real-forgejo.sh docker`: a real Forgejo, the provider on the engine the test runs
-  on, real jobs in each slot's own Docker, learned and packed by their peaks.
+  on, real jobs in each slot's own Docker, learned and packed by their peaks; each slot with a
+  cache volume of its own, made at its first use, and one slot paused throughout, which runs
+  no job and is ready once resumed.

@@ -19,10 +19,12 @@ labels:
     docker: docker:docker://node:24-trixie
   shared:
     docker: docker:docker://node:24-trixie
-# Per class, the Incus volume attached at cache_path (optional).
+# Per class, the Incus volume attached at cache_path (optional), made in cache_pool when it
+# is not there. {slot} is the container, {host} this host's short name: a volume of each
+# slot's own. A plain name is one volume that the host's slots use at once.
 cache_volumes:
-  trusted: ci-cache-trusted
-  shared: ci-cache-shared
+  trusted: ci-cache-{slot}-trusted
+  shared: ci-cache-{slot}-shared
 cache_pool: default
 cache_path: /var/cache/forgejo-runner
 idle_hours: 24

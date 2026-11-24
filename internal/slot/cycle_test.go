@@ -95,7 +95,13 @@ func (f *fakeSystem) TookTask() bool {
 	return f.took
 }
 
-func (f *fakeSystem) SaveJournal() { f.calls = append(f.calls, "journal") }
+func (f *fakeSystem) SaveJournal(failed bool) {
+	if failed {
+		f.calls = append(f.calls, "journal failed")
+		return
+	}
+	f.calls = append(f.calls, "journal")
+}
 
 func (f *fakeSystem) CPU() (int64, int64, bool) {
 	// One core busy, a tenth of the time waiting: the counters follow the clock.
@@ -275,7 +281,8 @@ func TestReportsARunnerItCouldNotSetUpAsUnused(t *testing.T) {
 	c := newCycle(t, dir, sys, sys.clock.stop(100))
 	assign(t, dir, nil)
 	a, _ := c.WaitAssignment()
-	if c.Serve(a) || c.State() != "failed" || !c.Last().Unused || slices.Contains(sys.calls, "start") {
+	if c.Serve(a) || c.State() != "failed" || !c.Last().Unused || slices.Contains(sys.calls, "start") ||
+		!slices.Contains(sys.calls, "journal failed") {
 		t.Fatalf("state %s, last %+v, calls %v", c.State(), c.Last(), sys.calls)
 	}
 }
@@ -519,5 +526,66 @@ func TestAJobBetweenTwoLooksIsAJob(t *testing.T) {
 	}
 	if last := c.Last(); last.Unused || last.Task != 9 || last.PeakMiB != 64 || last.CPUCores != 0 {
 		t.Fatalf("last %+v", last)
+	}
+}
+
+// A cache volume that is not there is made in the pool before it is attached; one that is
+// there is attached as it is.
+func TestACacheVolumeIsMadeAtItsFirstUse(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer map[string]string
+		create bool
+	}{
+		{"missing", map[string]string{"storage volume show": "ERR:Error: Storage pool volume not found"}, true},
+		{"there", map[string]string{"storage volume show": "name: cache-ci\n"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Settings{Container: "ci", ConfigTemplate: "/dev/null",
+				CacheVolumes: map[string]string{"shared": "cache-ci"}}
+			s.defaults()
+			var calls []string
+			i := NewIncus(s)
+			i.instance.(*IncusCommand).run = scripted(tc.answer, &calls)
+			if err := i.Apply(provider.Parsed{ID: "a-1", UUID: testUUID, Token: testToken, Class: "shared",
+				Labels: []string{"docker:docker://node:24-trixie"}}); err != nil {
+				t.Fatal(err)
+			}
+			created := slices.Index(calls, "storage volume create default cache-ci")
+			attached := slices.IndexFunc(calls, func(c string) bool { return strings.HasPrefix(c, "config device add ci cache") })
+			if (created >= 0) != tc.create || attached < 0 || (tc.create && created > attached) {
+				t.Fatalf("calls %v", calls)
+			}
+		})
+	}
+}
+
+func TestASettingsFilesCacheOfItsOwn(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "ci-a.yml"), "container: ci-a\nconfig_template: /dev/null\n"+
+		"labels: {shared: {docker: d}}\ncache_volumes: {shared: \"cache-{host}-{slot}\", trusted: plain}\n")
+	s, err := LoadSettings(filepath.Join(dir, "ci-a.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "cache-" + shortHostname() + "-ci-a"; s.CacheVolumes["shared"] != want || s.CacheVolumes["trusted"] != "plain" {
+		t.Fatalf("volumes %v, want %s", s.CacheVolumes, want)
+	}
+	write(t, filepath.Join(dir, "ci-b.yml"), "container: ci-b\nconfig_template: /dev/null\n"+
+		"labels: {shared: {docker: d}}\ncache_volumes: {shared: \"cache-{class}\"}\n")
+	if _, err := LoadSettings(filepath.Join(dir, "ci-b.yml")); err == nil || !strings.Contains(err.Error(), "placeholders") {
+		t.Fatalf("an unknown placeholder: %v", err)
+	}
+}
+
+// A runner that exits at once without a job failed: its journal is saved as a failure's.
+func TestARunnerThatExitsAtOnceFailed(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: []look{{false, false}}}
+	c := newCycle(t, dir, sys, sys.clock.stop(100))
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	if c.Serve(a) || c.State() != "failed" || !slices.Contains(sys.calls, "journal failed") {
+		t.Fatalf("state %s, calls %v", c.State(), sys.calls)
 	}
 }

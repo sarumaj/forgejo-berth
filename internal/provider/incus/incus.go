@@ -13,15 +13,36 @@ import (
 )
 
 // Settings are the cycle's settings of a host's slot (a container of the server): its
-// state in <state_dir>/<host>/.
+// state in <state_dir>/<host>/, its cache volumes' names expanded for it.
 func Settings(c config.Incus, host, container string) *slot.Settings {
 	s := &slot.Settings{Container: container, StateDir: filepath.Join(c.StateDir, host),
 		Snapshot: c.Snapshot, ConfigTemplate: c.ConfigTemplate, ConfigPath: c.ConfigPath,
 		TokenPath: c.TokenPath, RunnerService: c.RunnerService, RunnerUser: c.RunnerUser,
 		WorkDir: c.WorkDir, IdleHours: c.IdleHours, JobHours: c.JobHours, BootTimeout: c.BootTimeout,
-		LabelTables: c.Labels, CacheVolumes: c.CacheVolumes, CachePool: c.CachePool, CachePath: c.CachePath}
+		LabelTables: c.Labels, CacheVolumes: slot.ExpandVolumes(c.CacheVolumes, host, container), CachePool: c.CachePool, CachePath: c.CachePath}
 	s.Defaults()
 	return s
+}
+
+// Slots are the hosts' slot sides, their cycles not started: what pausing and resuming a
+// slot changes (their state directories).
+func Slots(cfg *config.Config) (slot.Hosted, error) {
+	hosted := slot.Hosted{}
+	for _, h := range cfg.Hosts {
+		// The host's own configuration template and label tables, where it has them.
+		hc := cfg.Provider.Incus
+		hc.Slots = cfg.HostSlots(h)
+		slots := map[string]*slot.Settings{}
+		for _, name := range h.Slots {
+			slots[name] = Settings(hc, h.Name, name)
+		}
+		local, err := slot.NewLocal(slots)
+		if err != nil {
+			return nil, err
+		}
+		hosted[h.Name] = local
+	}
+	return hosted, nil
 }
 
 // New makes the provider of the configuration's hosts. Its cycles run once made (never in
@@ -30,20 +51,16 @@ func Settings(c config.Incus, host, container string) *slot.Settings {
 func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 	c := cfg.Provider.Incus
 	timeout := time.Duration(c.TimeoutSeconds * float64(time.Second))
-	hosted := slot.Hosted{}
+	hosted, err := Slots(cfg)
+	if err != nil {
+		return nil, err
+	}
 	for _, h := range cfg.Hosts {
-		client, err := NewClient(h.Address, c.TLS, c.Project)
+		client, err := NewClient(h.Address, cfg.HostTLS(h), c.Project)
 		if err != nil {
 			return nil, err
 		}
-		slots := map[string]*slot.Settings{}
-		for _, name := range h.Slots {
-			slots[name] = Settings(c, h.Name, name)
-		}
-		local, err := slot.NewLocal(slots)
-		if err != nil {
-			return nil, err
-		}
+		local := hosted[h.Name]
 		local.Ping = func(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -53,26 +70,13 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 			hostLog := log.With("host", h.Name)
 			local.Start(func(s *slot.Settings) slot.System {
 				system := slot.NewIncusOn(s, NewInstance(client, s.Container, timeout))
-				system.Out = journal{log: hostLog.With("container", s.Container)}
+				// The runner's journal in the broker's log, as an SSH host's cycle has it in
+				// its own: a runner that fails to start is seen without debug logging.
+				system.Log = hostLog.With("container", s.Container)
 				return system
 			}, hostLog)
 		}
 		hosted[h.Name] = local
 	}
 	return hosted, nil
-}
-
-// journal puts the runner's journal, as the cycle prints it, into the broker's log.
-type journal struct{ log *slog.Logger }
-
-func (j journal) Write(p []byte) (int, error) {
-	j.log.Debug("runner", "line", string(trimNewline(p)))
-	return len(p), nil
-}
-
-func trimNewline(p []byte) []byte {
-	if n := len(p); n > 0 && p[n-1] == '\n' {
-		return p[:n-1]
-	}
-	return p
 }

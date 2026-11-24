@@ -26,6 +26,7 @@ type Local struct {
 	// Ping tells whether the host's API answers (nil: always).
 	Ping     func(ctx context.Context) error
 	stopping atomic.Bool
+	started  atomic.Bool
 	wg       sync.WaitGroup
 }
 
@@ -41,6 +42,7 @@ func NewLocal(slots map[string]*Settings) (*Local, error) {
 
 // Start runs a cycle for each slot, with the system the function makes for it.
 func (l *Local) Start(system func(*Settings) System, log *slog.Logger) {
+	l.started.Store(true)
 	for _, name := range slices.Sorted(maps.Keys(l.slots)) {
 		s := l.slots[name]
 		c := NewCycle(s, system(s), CycleOptions{Log: log, Stopping: l.stopping.Load, Resume: true})
@@ -81,6 +83,39 @@ func (l *Local) Release(container, id string) error {
 	return Release(l.slots, container, id)
 }
 
+// Pause pauses the slot (see PauseSlot).
+func (l *Local) Pause(container string, stop bool) (string, error) {
+	return PauseSlot(l.slots, container, stop)
+}
+
+// Resume resumes the slot (see ResumeSlot).
+func (l *Local) Resume(container string) (string, error) {
+	return ResumeSlot(l.slots, container)
+}
+
+// Cycles reports the host's cycles from their state files, as the cycles on an SSH host
+// write them to their textfiles; none when they do not run here (shadow mode).
+func (l *Local) Cycles(host string) []provider.CycleStats {
+	if !l.started.Load() {
+		return nil
+	}
+	var stats []provider.CycleStats
+	for _, name := range slices.Sorted(maps.Keys(l.slots)) {
+		var st struct {
+			State            string  `json:"state"`
+			Jobs             int     `json:"jobs"`
+			Failures         int     `json:"failures"`
+			LastResetSeconds float64 `json:"last_reset_seconds"`
+		}
+		if data, err := os.ReadFile(l.slots[name].path(".json")); err == nil {
+			_ = json.Unmarshal(data, &st)
+		}
+		stats = append(stats, provider.CycleStats{Host: host, Container: name, State: st.State, Jobs: st.Jobs,
+			Failures: st.Failures, LastResetSeconds: st.LastResetSeconds})
+	}
+	return stats
+}
+
 // Hosted is a provider whose hosts' slot sides run in this process, by host name.
 type Hosted map[string]*Local
 
@@ -109,6 +144,33 @@ func (h Hosted) Release(_ context.Context, host config.Host, container, assignme
 		return fmt.Errorf("%s: no such host", host.Name)
 	}
 	return l.Release(container, assignment)
+}
+
+// Pause pauses a slot of the host.
+func (h Hosted) Pause(_ context.Context, host config.Host, container string, stop bool) (string, error) {
+	l, ok := h[host.Name]
+	if !ok {
+		return "", fmt.Errorf("%s: no such host", host.Name)
+	}
+	return l.Pause(container, stop)
+}
+
+// Resume resumes a slot of the host.
+func (h Hosted) Resume(_ context.Context, host config.Host, container string) (string, error) {
+	l, ok := h[host.Name]
+	if !ok {
+		return "", fmt.Errorf("%s: no such host", host.Name)
+	}
+	return l.Resume(container)
+}
+
+// Cycles reports every host's cycles, by host and container.
+func (h Hosted) Cycles() []provider.CycleStats {
+	var stats []provider.CycleStats
+	for _, name := range slices.Sorted(maps.Keys(h)) {
+		stats = append(stats, h[name].Cycles(name)...)
+	}
+	return stats
 }
 
 // Stop stops every host's cycles.

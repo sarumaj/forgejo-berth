@@ -102,3 +102,31 @@ func TestAHandoffNeverPrintsItsToken(t *testing.T) {
 		}
 	}
 }
+
+func TestPauseAndResumeThroughTheSlotCommand(t *testing.T) {
+	var calls []call
+	s := NewSSH(sshConfig(), fake("running\n", nil, &calls))
+	if state, err := s.Pause(context.Background(), host, "b", false); err != nil || state != "running" {
+		t.Fatalf("pause: %q %v", state, err)
+	}
+	if _, err := s.Pause(context.Background(), host, "b", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Resume(context.Background(), host, "b"); err != nil {
+		t.Fatal(err)
+	}
+	var requests []string
+	for _, c := range calls {
+		requests = append(requests, c.argv[len(c.argv)-1])
+	}
+	if want := []string{"pause b", "pause b stop", "resume b"}; !slices.Equal(requests, want) {
+		t.Fatalf("requests %v, want %v", requests, want)
+	}
+	if _, err := s.Pause(context.Background(), host, "-b", false); err == nil {
+		t.Fatal("paused a slot that is no name")
+	}
+	slots, _ := ParseStatus("ci-1", []byte(`{"slots": [{"container": "b", "state": "running", "paused": true}]}`))
+	if len(slots) != 1 || !slots[0].Paused {
+		t.Fatalf("slots %+v", slots)
+	}
+}

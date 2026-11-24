@@ -5,8 +5,10 @@
 //
 //	forgejo-berth run [--config FILE] [--shadow]        the broker
 //	forgejo-berth check [--config FILE]                 checks the configuration and the secrets
-//	forgejo-berth slot [--settings-dir DIR] [REQUEST]   the slot's forced SSH command
+//	forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]  the slot's forced SSH command
 //	forgejo-berth cycle [--settings-dir DIR] CONTAINER  one slot's reset cycle
+//	forgejo-berth pause [--config FILE] [--stop] HOST/SLOT  holds a slot out of service
+//	forgejo-berth resume [--config FILE] HOST/SLOT      puts it back
 //	forgejo-berth version
 package main
 
@@ -23,6 +25,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -46,8 +50,10 @@ const (
 	defaultSettingsDir = "/etc/forgejo-berth/slots"
 	usage              = `usage: forgejo-berth run [--config FILE] [--shadow]
        forgejo-berth check [--config FILE]
-       forgejo-berth slot [--settings-dir DIR] [REQUEST]
+       forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]
        forgejo-berth cycle [--settings-dir DIR] [--log-format text|json] CONTAINER
+       forgejo-berth pause [--config FILE] [--stop] HOST/SLOT
+       forgejo-berth resume [--config FILE] HOST/SLOT
        forgejo-berth version`
 )
 
@@ -72,6 +78,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runSlot(args[1:], stdin, stdout, stderr)
 	case "cycle":
 		return runCycle(args[1:], stdout, stderr)
+	case "pause", "resume":
+		return runPause(args[0], args[1:], stdout, stderr)
 	}
 	fmt.Fprintln(stderr, usage)
 	return 2
@@ -135,19 +143,19 @@ func check(args []string, stdout, stderr io.Writer) int {
 }
 
 // checkFiles checks that the provider's files are there: the SSH key, or the TLS files
-// and the runner's configuration template.
+// and the runner's configuration templates, each host's own included.
 func checkFiles(cfg *config.Config) error {
 	var files, secrets []string
 	p := cfg.Provider
 	switch p.Type {
 	case config.ProviderSSH:
 		secrets = []string{p.SSH.KeyFile}
-	case config.ProviderDocker:
-		files = []string{p.Docker.TLS.CAFile, p.Docker.TLS.CertFile, p.Docker.ConfigTemplate}
-		secrets = []string{p.Docker.TLS.KeyFile}
-	case config.ProviderIncus:
-		files = []string{p.Incus.TLS.CAFile, p.Incus.TLS.CertFile, p.Incus.ConfigTemplate}
-		secrets = []string{p.Incus.TLS.KeyFile}
+	case config.ProviderDocker, config.ProviderIncus:
+		for _, h := range cfg.Hosts {
+			t := cfg.HostTLS(h)
+			files = append(files, t.CAFile, t.CertFile, cfg.HostSlots(h).ConfigTemplate)
+			secrets = append(secrets, t.KeyFile)
+		}
 	}
 	for _, f := range secrets {
 		if f != "" {
@@ -286,11 +294,15 @@ func look(ctx context.Context, b *broker.Broker, cfg *config.Config, log *slog.L
 	}
 }
 
+// runSlot is the slot's forced command. The request is one argument, after the flags; after
+// "--" it is never taken for a flag, whatever it begins with, so a forced command of the form
+// slot -- "$SSH_ORIGINAL_COMMAND" cannot be given flags by the request.
 func runSlot(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("slot", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dir := fs.String("settings-dir", defaultSettingsDir, "the slots' settings")
 	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "usage: forgejo-berth slot [--settings-dir DIR] [--] [REQUEST]")
 		return 2
 	}
 	request := os.Getenv("SSH_ORIGINAL_COMMAND")
@@ -302,6 +314,75 @@ func runSlot(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return slot.Command(request, *dir, stdin, stdout, stderr)
+}
+
+// runPause pauses or resumes a slot of the configuration: through the slot command for an
+// SSH host, in the broker's state directory for the docker and incus providers (whose running
+// broker's cycles see it there).
+func runPause(name string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("config", defaultConfig, "the configuration file")
+	var stop bool
+	if name == "pause" {
+		fs.BoolVar(&stop, "stop", false, "stop the slot's job at once rather than let it end")
+	}
+	if err := fs.Parse(args); err != nil || fs.NArg() != 1 {
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
+	hostName, container, _ := strings.Cut(fs.Arg(0), "/")
+	if !config.Name.MatchString(hostName) || !config.Name.MatchString(container) {
+		fmt.Fprintf(stderr, "%q is not HOST/SLOT\n", fs.Arg(0))
+		return 2
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	err = func() error {
+		host, ok := cfg.Host(hostName)
+		if !ok {
+			return fmt.Errorf("no host %s in the configuration", hostName)
+		}
+		var slots provider.Pauser
+		switch cfg.Provider.Type {
+		case config.ProviderDocker, config.ProviderIncus:
+			if !slices.Contains(host.Slots, container) {
+				return fmt.Errorf("no slot %s on %s", container, hostName)
+			}
+			if cfg.Provider.Type == config.ProviderDocker {
+				slots, err = docker.Slots(cfg)
+			} else {
+				slots, err = incus.Slots(cfg)
+			}
+			if err != nil {
+				return err
+			}
+		default:
+			slots = provider.NewSSH(cfg.Provider.SSH, nil)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		var state string
+		if name == "pause" {
+			state, err = slots.Pause(ctx, host, container, stop)
+		} else {
+			state, err = slots.Resume(ctx, host, container)
+		}
+		if err != nil {
+			return err
+		}
+		done := map[bool]string{true: "paused", false: "resumed"}[name == "pause"]
+		fmt.Fprintf(stdout, "%s/%s: %s; the slot is %s\n", hostName, container, done, state)
+		return nil
+	}()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 func runCycle(args []string, stdout, stderr io.Writer) int {

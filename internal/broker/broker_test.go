@@ -72,7 +72,11 @@ type fakeSlots struct {
 	down     map[string]bool
 	released []string
 	refuse   error
+	// cycles are the slots' cycles, as a provider that runs them reports them.
+	cycles []provider.CycleStats
 }
+
+func (f *fakeSlots) Cycles() []provider.CycleStats { return f.cycles }
 
 func (f *fakeSlots) Status(_ context.Context, h config.Host) ([]provider.Slot, error) {
 	if f.down[h.Name] {
@@ -431,6 +435,33 @@ func TestMetrics(t *testing.T) {
 		if !strings.Contains(text, line+"\n") {
 			t.Errorf("metrics lack %s:\n%s", line, text)
 		}
+	}
+	if strings.Contains(text, "forgejo_berth_cycle_") {
+		t.Errorf("cycle metrics without cycles:\n%s", text)
+	}
+
+	// The cycles the provider runs: the metrics a cycle on its host writes, with the host.
+	h.slots.cycles = []provider.CycleStats{
+		{Host: "ci-1", Container: "a", State: provider.Running, Jobs: 3, LastResetSeconds: 4.25},
+		{Host: "ci-2", Container: "a", State: provider.Failed, Failures: 2},
+	}
+	h.tick(t)
+	text = h.Snapshot().Metrics()
+	for _, line := range []string{`forgejo_berth_cycle_state{host="ci-1",container="a",state="running"} 1`,
+		`forgejo_berth_cycle_state{host="ci-1",container="a",state="ready"} 0`,
+		`forgejo_berth_cycle_state{host="ci-2",container="a",state="failed"} 1`,
+		`forgejo_berth_cycle_jobs_total{host="ci-1",container="a"} 3`,
+		`forgejo_berth_cycle_failures{host="ci-2",container="a"} 2`,
+		`forgejo_berth_cycle_last_reset_seconds{host="ci-1",container="a"} 4.2`} {
+		if !strings.Contains(text, line+"\n") {
+			t.Errorf("metrics lack %s:\n%s", line, text)
+		}
+	}
+	if n := strings.Count(text, "# TYPE forgejo_berth_cycle_state gauge"); n != 1 {
+		t.Errorf("the cycle state's type %d times", n)
+	}
+	if data, _ := json.Marshal(h.Snapshot()); !strings.Contains(string(data), `"cycles":[{"host":"ci-1","container":"a"`) {
+		t.Errorf("the state lacks the cycles: %s", data)
 	}
 }
 

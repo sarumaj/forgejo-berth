@@ -90,6 +90,9 @@ type SlotStatus struct {
 	StateSince int64     `json:"state_since"`
 	Assignment string    `json:"assignment"`
 	Last       *Finished `json:"last"`
+	// Paused is set while the slot is paused or pausing; a slot side that knows no pause
+	// omits it.
+	Paused bool `json:"paused,omitempty"`
 }
 
 // Finished is a slot's last finished assignment.
@@ -131,7 +134,8 @@ func FromStatus(host string, doc StatusDocument) []Slot {
 		if st.Container == "" {
 			continue
 		}
-		slot := Slot{Host: host, Container: st.Container, State: st.State, Assignment: st.Assignment}
+		slot := Slot{Host: host, Container: st.Container, State: st.State, Assignment: st.Assignment,
+			Paused: st.Paused}
 		if st.Last != nil {
 			slot.Finished, slot.Task, slot.PeakMiB = st.Last.Assignment, st.Last.Task, st.Last.PeakMiB
 			slot.Seconds, slot.Unused = st.Last.Seconds, st.Last.Unused
@@ -163,6 +167,29 @@ func (s *SSH) Assign(ctx context.Context, host config.Host, container string, h 
 	_, err = s.request(ctx, host, "assign "+container, data)
 	clear(data)
 	return err
+}
+
+// Pause runs `pause <container>` (with `stop`, `pause <container> stop`); the slot side
+// answers with the slot's state.
+func (s *SSH) Pause(ctx context.Context, host config.Host, container string, stop bool) (string, error) {
+	if !config.Name.MatchString(container) {
+		return "", fmt.Errorf("container %q is not a slot name", container)
+	}
+	request := "pause " + container
+	if stop {
+		request += " stop"
+	}
+	out, err := s.request(ctx, host, request, nil)
+	return strings.TrimSpace(string(out)), err
+}
+
+// Resume runs `resume <container>`.
+func (s *SSH) Resume(ctx context.Context, host config.Host, container string) (string, error) {
+	if !config.Name.MatchString(container) {
+		return "", fmt.Errorf("container %q is not a slot name", container)
+	}
+	out, err := s.request(ctx, host, "resume "+container, nil)
+	return strings.TrimSpace(string(out)), err
 }
 
 // Release runs `release <container> <assignment>`.

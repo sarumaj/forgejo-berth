@@ -32,11 +32,13 @@ const (
 	hostSocket = "/var/run/docker.sock"
 )
 
-// Labels on the provider's containers and volumes.
+// Labels on the provider's containers and volumes; a cache volume the provider made has the
+// host's and the class's.
 const (
 	LabelHost       = "org.forgejo-berth.host"
 	LabelSlot       = "org.forgejo-berth.slot"
 	LabelAssignment = "org.forgejo-berth.assignment"
+	LabelCache      = "org.forgejo-berth.cache"
 )
 
 // wrapper runs the runner ("$@") and outlives it: the container stays up after the job, so
@@ -139,7 +141,11 @@ func (d *System) Apply(a provider.Parsed) error {
 		spec.Env = append(spec.Env, "DOCKER_HOST=unix://"+hostSocket)
 		spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, Mount{Type: "bind", Source: d.cfg.HostSocket, Target: hostSocket})
 	}
-	if volume := d.cfg.CacheVolumes[a.Class]; volume != "" {
+	if volume := d.settings.CacheVolumes[a.Class]; volume != "" {
+		// Made here rather than by the mount, so that it carries the provider's labels.
+		if err := d.engine.EnsureVolume(ctx, volume, map[string]string{LabelHost: d.host, LabelCache: a.Class}); err != nil {
+			return err
+		}
 		spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, Mount{Type: "volume", Source: volume, Target: d.cfg.CachePath})
 	}
 	if err := d.engine.Create(ctx, d.name, spec); err != nil {
@@ -157,7 +163,7 @@ func (d *System) Apply(a provider.Parsed) error {
 // runnerCommand is the runner for one job, as the wrapper's arguments.
 func (d *System) runnerCommand(a provider.Parsed) []string {
 	cmd := []string{"forgejo-runner"}
-	if d.cfg.ConfigTemplate != "" {
+	if d.settings.ConfigTemplate != "" {
 		cmd = append(cmd, "--config", filesDir+"/config.yml")
 	}
 	cmd = append(cmd, "one-job", "--wait", "--url", d.cfg.ForgejoURL, "--uuid", a.UUID,
@@ -234,8 +240,8 @@ func (d *System) files(ctx context.Context, a provider.Parsed) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d.cfg.ConfigTemplate != "" {
-		template, err := os.ReadFile(d.cfg.ConfigTemplate)
+	if d.settings.ConfigTemplate != "" {
+		template, err := os.ReadFile(d.settings.ConfigTemplate)
 		if err != nil {
 			return nil, err
 		}
@@ -246,7 +252,7 @@ func (d *System) files(ctx context.Context, a provider.Parsed) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if _, ok := d.cfg.CacheVolumes[a.Class]; ok {
+	if d.settings.CacheVolumes[a.Class] != "" {
 		// The volume's root, the runner's: it is mounted over the image's directory.
 		if err := w.WriteHeader(&tar.Header{Name: strings.TrimPrefix(path.Clean(d.cfg.CachePath), "/") + "/",
 			Typeflag: tar.TypeDir, Mode: 0o700, Uid: uid, Gid: gid, ModTime: time.Now()}); err != nil {
@@ -321,9 +327,10 @@ func (d *System) Busy() bool { return d.task() != 0 }
 // TookTask tells whether the runner's log shows it took a task.
 func (d *System) TookTask() bool { return d.task() != 0 }
 
-// SaveJournal logs the runner's output, its last journal_lines, as one record (debug): the
-// container goes at the next reset. A job's own output is Forgejo's, not the runner's.
-func (d *System) SaveJournal() {
+// SaveJournal logs the runner's output, its last journal_lines, as one record: the container
+// goes at the next reset. At debug, but at warn when the runner failed, its output then the
+// only account of why. A job's own output is Forgejo's, not the runner's.
+func (d *System) SaveJournal(failed bool) {
 	ctx, cancel := d.ctx(1)
 	defer cancel()
 	logs, err := d.engine.Logs(ctx, d.name, d.settings.JournalLines)
@@ -331,7 +338,11 @@ func (d *System) SaveJournal() {
 		d.log.Warn("the runner's log could not be read", "error", err)
 		return
 	}
-	d.log.Debug("the runner's log", "log", strings.TrimRight(logs, "\n"))
+	level := slog.LevelDebug
+	if failed {
+		level = slog.LevelWarn
+	}
+	d.log.Log(context.Background(), level, "the runner's log", "log", strings.TrimRight(logs, "\n"))
 }
 
 // containers are the slot's containers whose cgroups count: the runner's, and its Docker's,

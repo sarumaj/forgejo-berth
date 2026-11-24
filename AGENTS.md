@@ -2,7 +2,8 @@
 
 A broker that gives each waiting Forgejo Actions job an ephemeral runner on a container slot of
 a fixed host, admitted by the job's learned memory peak. One Go binary: `run` (the broker),
-`slot` (the forced SSH command on a CI host), `cycle` (one slot's reset cycle). Providers:
+`slot` (the forced SSH command on a CI host), `cycle` (one slot's reset cycle), `pause` and
+`resume` (a slot out of service and back). Providers:
 `ssh` (that slot command), `docker` and `incus` (the slots' cycles in the broker, on an
 Engine API or the Incus API). The design is
 [docs/design.md](docs/design.md); keep it true when behaviour changes.

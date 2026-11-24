@@ -52,7 +52,9 @@ type Settings struct {
 	// LabelTables maps a class (trusted, shared) to its label names and the runner label of
 	// each: a class not listed is refused.
 	LabelTables map[string]map[string]string `yaml:"labels" json:"labels"`
-	// CacheVolumes maps a class to the Incus volume attached at CachePath (none: no cache).
+	// CacheVolumes maps a class to the Incus volume attached at CachePath (none: no cache),
+	// made in CachePool when it does not exist. In a settings file, {slot} in a name is the
+	// container's and {host} the host's short name, for a volume of each slot's own.
 	CacheVolumes map[string]string `yaml:"cache_volumes" json:"cache_volumes"`
 	CachePool    string            `yaml:"cache_pool" json:"cache_pool"`
 	CachePath    string            `yaml:"cache_path" json:"cache_path"`
@@ -112,7 +114,37 @@ func (s *Settings) check() error {
 	if s.ConfigTemplate == "" {
 		return fmt.Errorf("%s: config_template is required", s.Container)
 	}
+	for class, volume := range s.CacheVolumes {
+		if volume == "" {
+			continue
+		}
+		if err := config.CheckVolume(volume); err != nil {
+			return fmt.Errorf("%s: cache_volumes.%s: %w", s.Container, class, err)
+		}
+	}
 	return nil
+}
+
+// ExpandVolumes returns the cache volumes with their names expanded for the host's slot.
+func ExpandVolumes(volumes map[string]string, host, slot string) map[string]string {
+	if volumes == nil {
+		return nil
+	}
+	expanded := make(map[string]string, len(volumes))
+	for class, name := range volumes {
+		expanded[class] = config.ExpandVolume(name, host, slot)
+	}
+	return expanded
+}
+
+// shortHostname is this host's name up to its first dot, for {host} in a settings file.
+func shortHostname() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return "localhost"
+	}
+	short, _, _ := strings.Cut(name, ".")
+	return short
 }
 
 // LoadSettings reads one slot's settings file; unknown keys are ignored, as the file may
@@ -132,6 +164,7 @@ func LoadSettings(path string) (*Settings, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	s.defaults()
+	s.CacheVolumes = ExpandVolumes(s.CacheVolumes, shortHostname(), s.Container)
 	if err := s.check(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}

@@ -12,13 +12,32 @@ import (
 	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 )
 
-// Settings are the cycle's settings of a host's slot: its state in <state_dir>/<host>/.
+// Settings are the cycle's settings of a host's slot: its state in <state_dir>/<host>/, its
+// cache volumes' names expanded for it.
 func Settings(s config.Slots, host, name string) *slot.Settings {
 	settings := &slot.Settings{Container: name, StateDir: filepath.Join(s.StateDir, host),
-		LabelTables: s.Labels, ConfigTemplate: s.ConfigTemplate, CacheVolumes: s.CacheVolumes,
+		LabelTables: s.Labels, ConfigTemplate: s.ConfigTemplate, CacheVolumes: slot.ExpandVolumes(s.CacheVolumes, host, name),
 		CachePath: s.CachePath, IdleHours: s.IdleHours, JobHours: s.JobHours, BootTimeout: s.BootTimeout}
 	settings.Defaults()
 	return settings
+}
+
+// Slots are the hosts' slot sides, their cycles not started: what pausing and resuming a
+// slot changes (their state directories).
+func Slots(cfg *config.Config) (slot.Hosted, error) {
+	hosted := slot.Hosted{}
+	for _, h := range cfg.Hosts {
+		slots := map[string]*slot.Settings{}
+		for _, name := range h.Slots {
+			slots[name] = Settings(cfg.HostSlots(h), h.Name, name)
+		}
+		local, err := slot.NewLocal(slots)
+		if err != nil {
+			return nil, err
+		}
+		hosted[h.Name] = local
+	}
+	return hosted, nil
 }
 
 // New makes the provider of the configuration's hosts. Its cycles run once started (never
@@ -26,20 +45,16 @@ func Settings(s config.Slots, host, name string) *slot.Settings {
 // containers to the next start.
 func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 	d := cfg.Provider.Docker
-	hosted := slot.Hosted{}
+	hosted, err := Slots(cfg)
+	if err != nil {
+		return nil, err
+	}
 	for _, h := range cfg.Hosts {
-		engine, err := NewEngine(h.Address, d.TLS)
+		engine, err := NewEngine(h.Address, cfg.HostTLS(h))
 		if err != nil {
 			return nil, err
 		}
-		slots := map[string]*slot.Settings{}
-		for _, name := range h.Slots {
-			slots[name] = Settings(d.Slots, h.Name, name)
-		}
-		local, err := slot.NewLocal(slots)
-		if err != nil {
-			return nil, err
-		}
+		local := hosted[h.Name]
 		local.Ping = func(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, durationSeconds(d.TimeoutSeconds))
 			defer cancel()
@@ -51,7 +66,6 @@ func New(cfg *config.Config, log *slog.Logger) (slot.Hosted, error) {
 				return NewSystem(engine, d, s, h.Name, prefix+s.Container, log)
 			}, log.With("host", h.Name))
 		}
-		hosted[h.Name] = local
 	}
 	return hosted, nil
 }
