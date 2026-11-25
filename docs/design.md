@@ -278,14 +278,17 @@ loop:
 4. **running**: the runner took its job (a step's process, a host-mode job directory or a
    populated Docker scope under the runner's cgroup). A runner with no job after the
    assignment's `unused_minutes`, or released by the broker, is stopped, unless its journal shows
-   it took a task (a job still pulling its image). A job longer than `job_hours` is cut;
+   it took a task (a job still pulling its image). A job longer than `job_hours` is cut
+   short (see [Cutting a job short](#cutting-a-job-short));
 5. **finish**: note the task id (the first `task N repo is` line of the runner's journal) and the
    container cgroup's `memory.peak` plus `memory.swap.peak` (rounded up to MiB) in the state's
    `last`, with the job's CPU use (see [CPU](#cpu)); then back to 1. The peak is the job's
    own: the container was started for it alone.
 
 Failures back off from 30 seconds, doubling to 10 minutes. A SIGTERM ends the loop after the
-step in progress and leaves the container as it is (`stopped`).
+step in progress and leaves the container as it is (`stopped`). An SSH host's cycle that
+starts while the runner its last cycle served is still active stops that runner as below
+before its first reset.
 
 The state goes to `<state_dir>/<container>.json`; the assignment to `<container>.assignment`,
 the release to `<container>.release`, a pause to `<container>.pause`.
@@ -299,8 +302,8 @@ content `finish` or `stop`; removed by `resume`). The cycle reads it at each of 
   holds its runner); otherwise the cycle holds the slot (`paused`) at once, without a reset;
 - **assigned** (a runner without a job): the runner is stopped as for a release, unless its
   journal shows it took a task; that is no failure of the slot (no back-off);
-- **running**: the job runs to its end; with `stop` it is cut as a job over `job_hours` is,
-  and the reset stops it;
+- **running**: the job runs to its end; with `stop` it is cut short as a job over
+  `job_hours` is;
 - **reset**: after every reset the cycle holds a paused slot instead of waiting for an
   assignment.
 
@@ -315,6 +318,34 @@ reset that a start does otherwise: the container may be in the middle of its cha
 paused while no cycle ran is reset at the start, then held. The pause file lives as long as
 `state_dir`: the broker's (beside the history) is on disk; an SSH host's default
 (`/run/forgejo-berth`) is not kept over the host's reboot.
+
+### Cutting a job short
+
+A job is cut short when it runs longer than `job_hours` and when its slot is paused with
+`stop`. The cycle does not reset the container under it: it stops the runner (`systemctl stop
+--no-block <runner_service>` in an Incus container, a SIGTERM to a Docker slot's runner) and
+waits up to `stop_timeout` seconds (90) for the runner to exit, looking at it every
+`interval`. Only then does it measure the job and reset the container; a runner still active
+after `stop_timeout` is killed by the reset. The log says which (`the runner exited when
+stopped`, or `the runner did not exit within stop_timeout` at warn). A runner without a job
+that is stopped (unused, released, its slot paused) is waited for the same way.
+
+Stopped so, `forgejo-runner one-job` cancels its job's context: the steps are stopped, the
+job's post steps and containers are cleaned up, and the runner reports the job's end (a
+failure, its unfinished steps cancelled) to Forgejo before it exits. Forgejo then goes on
+with the run: jobs that `need` the cut one are resolved (skipped) at once. A runner killed
+with its container reports nothing: its task stays `running` until Forgejo's reaper of tasks
+whose runner is gone ends it (`ZOMBIE_TASK_TIMEOUT`, 10 minutes by default), and Forgejo 17
+does not then resolve the jobs that need it: they stay `blocked`, holding the run and its
+concurrency group, until abandoned jobs are cancelled a day later.
+
+The runner's own `runner.shutdown_timeout` does not matter: `one-job` cancels its job at the
+signal (it is the daemon mode that waits that long for running jobs, and it takes no
+ephemeral runner). What the runner needs is the time to clean up and report: a few seconds
+usually, more for post steps that upload or save a cache, and for a Forgejo that is slow to
+answer (the runner retries its final report ten times, from 100 ms doubling). An Incus slot's
+runner unit should let systemd wait at least as long (`TimeoutStopSec`, 90 seconds by
+default) before it kills the runner.
 
 ### Cache volumes
 

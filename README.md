@@ -140,7 +140,8 @@ Put `forgejo-berth` on every CI host too.
 
 1. Make the containers: each runs `forgejo-runner one-job` as a systemd unit, the runner's
    configuration written from a template (see
-   [examples/runner-config.yml](examples/runner-config.yml)). Snapshot each one clean (`incus
+   [examples/runner-config.yml](examples/runner-config.yml)), its `TimeoutStopSec` at least
+   `stop_timeout` ([Jobs cut short](#jobs-cut-short)). Snapshot each one clean (`incus
    snapshot create ci-a clean`).
 2. Write a slot file per container into `/etc/forgejo-berth/slots/`
    ([examples/slot.yml](examples/slot.yml)) and start
@@ -212,6 +213,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.docker.idle_hours`      | 24                                      | a ready slot is reset after that                                                        |
 | `provider.docker.job_hours`       | 4                                       | a job is cut after that                                                                 |
 | `provider.docker.boot_timeout`    | 300                                     | seconds for the slot's Docker to answer                                                 |
+| `provider.docker.stop_timeout`    | 90                                      | seconds a runner whose job is cut short has to report it and exit                       |
 | `provider.docker.timeout_seconds` | 20                                      | one API request                                                                         |
 | `provider.incus.tls`              | none                                    | `ca_file` (the server's certificate, pinned, or a CA), `cert_file`, `key_file`          |
 | `provider.incus.project`          | `default`                               | the containers' project                                                                 |
@@ -226,6 +228,7 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `provider.incus.labels`           | required                                | as for `docker`                                                                         |
 | `provider.incus.cache_volumes`    | none                                    | per class, an Incus volume at `cache_path`; as for `docker`                             |
 | `provider.incus.…`                | as for `docker`                         | `cache_path`, `state_dir`, `idle_hours`, `job_hours`, `boot_timeout`, `timeout_seconds` |
+| `provider.incus.stop_timeout`     | 90                                      | as for `docker`; at most the runner unit's `TimeoutStopSec`                             |
 | `estimate.history_runs`           | 5                                       | the last runs that count                                                                |
 | `estimate.spike_days`             | 30                                      | runs within that many days count too                                                    |
 | `estimate.margin`                 | 1.2                                     | on the job's own peak                                                                   |
@@ -310,6 +313,30 @@ its own; at warn when the runner failed (it did not start, or exited at once wit
 so that the reason is there without debug logging. A Docker slot's runner log is one record, at
 debug, or at warn when the runner failed.
 
+## Jobs cut short
+
+A job is cut short when it runs longer than `job_hours`, and when its slot is paused with
+`--stop`. berth then stops the runner, not the container: `systemctl stop <runner_service>` in
+an Incus container, a SIGTERM to a Docker slot's runner. `forgejo-runner one-job` cancels its
+job at that signal and reports the job's end to Forgejo (a failure, the unfinished steps
+cancelled) before it exits, so that Forgejo goes on with the run: a job that `needs` the cut one
+is skipped at once. berth waits up to `stop_timeout` seconds (90) for the runner to exit, and
+only then resets the container; a runner still active after that is killed with it, and its
+job is left to Forgejo: it stays running until Forgejo's reaper of tasks without a runner ends
+it (`ZOMBIE_TASK_TIMEOUT`), and the jobs that need it may stay blocked
+([design](docs/design.md#cutting-a-job-short)).
+
+What the runner needs:
+
+- `one-job`, as berth's runners are (an ephemeral runner takes no other mode). Its
+  `runner.shutdown_timeout` does not matter: `one-job` cancels its job at the signal, whatever
+  that setting says. Nothing in the configuration template needs to change;
+- the time to clean up and report: post steps (a cache saved, say) run after the cancel.
+  Raise `stop_timeout` where they take longer than 90 seconds;
+- in an Incus container, a runner unit that lets systemd wait as long: its `TimeoutStopSec`
+  (systemd's default, 90 seconds) at least `stop_timeout`, or systemd kills the runner first.
+  The Docker provider's runner container has nothing that kills it sooner.
+
 ## Cache volumes
 
 `cache_volumes` gives the runner a volume at `cache_path` that outlives the slot's reset, per
@@ -377,12 +404,13 @@ forgejo-berth pause --config /etc/forgejo-berth/config.yml --stop ci-1/ci-a   # 
 forgejo-berth resume --config /etc/forgejo-berth/config.yml ci-1/ci-a
 ```
 
-A paused slot takes no new assignment. A runner it holds that has no job yet is stopped (the
-broker starts another one elsewhere); a job it runs runs to its end, or with `--stop` is cut at
-once. Then the slot is reset as after every job and stays `paused`: an Incus container restored
-and running, untouched until it is resumed; a Docker slot without containers. Resumed, it is
-reset again (an Incus container restored from its snapshot, which may be a new one) and is
-`ready`. The slot reports `paused` in its state and in `forgejo_berth_cycle_state`.
+A paused slot takes no new assignment. A runner it holds that has no job yet is stopped (the broker
+starts another one elsewhere); a job it runs runs to its end, or with `--stop` is cut short at once
+([Jobs cut short](#jobs-cut-short)). Then the slot is reset as after every job and stays `paused`:
+an Incus container restored and running, untouched until it is resumed; a Docker slot without
+containers. Resumed, it is reset again (an Incus container restored from its snapshot, which may be
+a new one) and is `ready`. The slot reports `paused` in its state and in
+`forgejo_berth_cycle_state`.
 
 The pause is a file beside the slot's state (`<state_dir>/[<host>/]<slot>.pause`), so it
 survives a restart of the broker or of the cycle: a slot still paused is left as it is, not

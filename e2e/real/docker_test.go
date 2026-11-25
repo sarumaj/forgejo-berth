@@ -57,7 +57,7 @@ func TestRealForgejoDocker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(state, "real-e2e", "c.pause"), []byte("finish\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	scenario(t, fmt.Sprintf(`hosts: [{name: real-e2e, address: %q, memory_mib: 4000, slots: [a, b, c]}]
+	b, logs := scenario(t, fmt.Sprintf(`hosts: [{name: real-e2e, address: %q, memory_mib: 4000, slots: [a, b, c]}]
 provider:
   type: docker
   docker:
@@ -106,23 +106,35 @@ provider:
 	t.Logf("cycles %+v, cache volumes %v", cycles, volumes)
 
 	// Resumed: the slot is reset and ready.
-	if _, err := hosted.(slot.Hosted).Resume(context.Background(), config.Host{Name: "real-e2e"}, "c"); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Minute)
-	for {
-		state := ""
-		for _, c := range hosted.(slot.Hosted).Cycles() {
-			if c.Container == "c" {
-				state = c.State
+	slots := hosted.(slot.Hosted)
+	host := config.Host{Name: "real-e2e"}
+	resume := func(container string) {
+		if _, err := slots.Resume(context.Background(), host, container); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(3 * time.Minute)
+		for {
+			state := ""
+			for _, c := range slots.Cycles() {
+				if c.Container == container {
+					state = c.State
+				}
 			}
+			if state == provider.Ready {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the resumed slot is %s", state)
+			}
+			time.Sleep(time.Second)
 		}
-		if state == provider.Ready {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the resumed slot is %s", state)
-		}
-		time.Sleep(time.Second)
 	}
+	resume("c")
+
+	// A job that a pause at once cuts short ends as its runner reports it.
+	cutShort(t, b, logs, slots.Cycles, func(container string) {
+		if _, err := slots.Pause(context.Background(), host, container, true); err != nil {
+			t.Fatal(err)
+		}
+	}, resume)
 }

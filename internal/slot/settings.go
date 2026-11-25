@@ -40,9 +40,12 @@ type Settings struct {
 	WorkDir string `yaml:"work_dir" json:"work_dir"`
 	// IdleHours refreshes a ready container that long without an assignment; JobHours cuts a
 	// job that runs longer.
-	IdleHours    float64 `yaml:"idle_hours" json:"idle_hours"`
-	JobHours     float64 `yaml:"job_hours" json:"job_hours"`
-	BootTimeout  float64 `yaml:"boot_timeout" json:"boot_timeout"`
+	IdleHours   float64 `yaml:"idle_hours" json:"idle_hours"`
+	JobHours    float64 `yaml:"job_hours" json:"job_hours"`
+	BootTimeout float64 `yaml:"boot_timeout" json:"boot_timeout"`
+	// StopTimeout is how long a runner that is stopped, its job cut short, has to cancel the
+	// job, report its end to Forgejo and exit (seconds), before the reset kills it.
+	StopTimeout  float64 `yaml:"stop_timeout" json:"stop_timeout"`
 	JournalLines int     `yaml:"journal_lines" json:"journal_lines"`
 	// Interval is the time between two looks at the runner (seconds).
 	Interval    float64 `yaml:"interval" json:"interval"`
@@ -89,6 +92,7 @@ func (s *Settings) defaults() {
 	num(&s.IdleHours, 24)
 	num(&s.JobHours, 4)
 	num(&s.BootTimeout, 300)
+	num(&s.StopTimeout, 90)
 	if s.JournalLines == 0 {
 		s.JournalLines = 2000
 	}

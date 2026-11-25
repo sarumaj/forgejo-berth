@@ -306,9 +306,9 @@ func TestRealForgejo(t *testing.T) {
 // scenario runs two owners' workflows through the broker with the provider: the broker
 // learns their peaks and CPU use, and the next build reserves its own peak with the margin.
 // between (when set) runs after the first round, with the configuration's file. It returns
-// the broker and its log.
+// the broker and its log, which goes on with the broker's later looks.
 func scenario(t *testing.T, hosts string, slots func(*config.Config, *slog.Logger) provider.Provider,
-	between func(configFile string)) (*broker.Broker, string) {
+	between func(configFile string)) (*broker.Broker, *syncBuffer) {
 	base := env(t, "BERTH_REAL_URL")
 	adminFile := env(t, "BERTH_REAL_ADMIN_TOKEN_FILE")
 	aliceFile := env(t, "BERTH_REAL_ALICE_TOKEN_FILE")
@@ -335,11 +335,12 @@ history: {path: %s}
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer hist.Close()
-	var logs syncBuffer
-	var out io.Writer = &logs
+	// Closed at the test's end: the caller may go on with the broker.
+	t.Cleanup(func() { _ = hist.Close() })
+	logs := &syncBuffer{}
+	var out io.Writer = logs
 	if os.Getenv("BERTH_REAL_VERBOSE") != "" {
-		out = io.MultiWriter(&logs, os.Stderr)
+		out = io.MultiWriter(logs, os.Stderr)
 	}
 	log := slog.New(slog.NewTextHandler(out, nil))
 	b, err := broker.New(cfg, broker.Options{
@@ -413,5 +414,142 @@ history: {path: %s}
 			t.Fatal("a token is in the log")
 		}
 	}
-	return b, logs.String()
+	return b, logs
+}
+
+// cutWorkflow is a job that runs until it is cut short, and a job that needs it.
+const cutWorkflow = `on: [push]
+defaults:
+  run:
+    shell: sh
+jobs:
+  long:
+    runs-on: docker
+    steps:
+      - run: echo started; sleep 1800
+  after:
+    needs: long
+    runs-on: docker
+    steps:
+      - run: echo after
+`
+
+// getJSON reads an API path as the token's owner.
+func getJSON(t *testing.T, base, token, path string) any {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, base+"/api/v1"+path, nil)
+	req.Header.Set("Authorization", "token "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode >= 300 {
+		t.Fatalf("GET %s: %d %v", path, resp.StatusCode, err)
+	}
+	return out
+}
+
+// listOf is a list answer's records: the answer itself, or its field key.
+func listOf(v any, key string) []map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		v = m[key]
+	}
+	list, _ := v.([]any)
+	var out []map[string]any
+	for _, e := range list {
+		if m, ok := e.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// cutShort runs a job that its slot's pause at once cuts short (pause, given the slot that
+// runs it), with the broker looking on. The runner, stopped, reports the job's end to
+// Forgejo itself, so that the run goes on at once: the job that needs it is skipped, rather
+// than blocked behind a task that only Forgejo's reaper of runner-less tasks would end
+// (ZOMBIE_TASK_TIMEOUT, 10 minutes), which does not resolve the jobs that need it. The slot
+// is resumed afterwards (resume) and must then be ready.
+func cutShort(t *testing.T, b *broker.Broker, logs *syncBuffer, cycles func() []provider.CycleStats,
+	pause, resume func(container string)) {
+	base := env(t, "BERTH_REAL_URL")
+	alice, _ := config.ReadSecret(env(t, "BERTH_REAL_ALICE_TOKEN_FILE"))
+	ctx := context.Background()
+	api(t, base, alice, "POST", "/user/repos", map[string]any{"name": "cut", "auto_init": true,
+		"default_branch": "main"})
+	push(t, base, alice, "alice/cut", ".forgejo/workflows/ci.yml", cutWorkflow)
+	jobs := func() map[string]string {
+		runs := listOf(getJSON(t, base, alice, "/repos/alice/cut/actions/runs"), "workflow_runs")
+		status := map[string]string{}
+		if len(runs) == 0 {
+			return status
+		}
+		path := fmt.Sprintf("/repos/alice/cut/actions/runs/%v/jobs", runs[0]["id"])
+		for _, j := range listOf(getJSON(t, base, alice, path), "jobs") {
+			status[fmt.Sprint(j["name"])] = fmt.Sprint(j["status"])
+		}
+		return status
+	}
+	running := func() string {
+		for _, c := range cycles() {
+			if c.State == provider.Running {
+				return c.Container
+			}
+		}
+		return ""
+	}
+	tick := func() {
+		if err := b.Tick(ctx); err != nil {
+			t.Logf("tick: %v", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	deadline := time.Now().Add(5 * time.Minute)
+	busy := ""
+	for busy == "" || jobs()["long"] != "running" {
+		if time.Now().After(deadline) {
+			t.Fatalf("the long job did not start: %v, cycles %+v\nlog:\n%s", jobs(), cycles(), logs.String())
+		}
+		tick()
+		busy = running()
+	}
+	// Its step runs.
+	time.Sleep(5 * time.Second)
+	pause(busy)
+	paused := time.Now()
+	deadline = paused.Add(3 * time.Minute)
+	for {
+		status := jobs()
+		if (status["long"] == "failure" || status["long"] == "cancelled") && status["after"] == "skipped" {
+			t.Logf("cut short: %v %.0f seconds after the pause", status, time.Since(paused).Seconds())
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the cut job's run: %v, cycles %+v\nlog:\n%s", status, cycles(), logs.String())
+		}
+		tick()
+	}
+	for {
+		state := ""
+		for _, c := range cycles() {
+			if c.Container == busy {
+				state = c.State
+			}
+		}
+		if state == provider.Paused {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the slot is %s, not paused\nlog:\n%s", state, logs.String())
+		}
+		tick()
+	}
+	text := logs.String()
+	if !strings.Contains(text, "msg=\"the runner exited when stopped\"") ||
+		strings.Contains(text, "did not exit within stop_timeout") {
+		t.Fatalf("the runner was not stopped gracefully\nlog:\n%s", text)
+	}
+	resume(busy)
 }

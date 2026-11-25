@@ -146,7 +146,8 @@ provider:
 	}
 	d := c.Provider.Docker
 	if d.JobEngine != EngineDinD || d.ForgejoURL != c.Forgejo.URL || d.StateDir != "/srv/berth/slots" ||
-		d.Image == "" || d.DinDImage == "" || d.JobHours != 4 || d.TimeoutSeconds != 20 {
+		d.Image == "" || d.DinDImage == "" || d.JobHours != 4 || d.StopTimeout != 90 ||
+		d.TimeoutSeconds != 20 {
 		t.Fatalf("docker defaults %+v", d)
 	}
 	for _, tc := range []struct{ name, provider, want string }{
@@ -155,6 +156,8 @@ provider:
 		{"an engine not known", `{type: docker, docker: {job_engine: socket, labels: {shared: {docker: d}}}}`,
 			"job_engine"},
 		{"a typo", `{type: docker, docker: {imag: x, labels: {shared: {docker: d}}}}`, "imag"},
+		{"a negative stop timeout", `{type: docker, docker: {stop_timeout: -1, labels: {shared: {docker: d}}}}`,
+			"stop_timeout"},
 		{"a remote engine without TLS", `{type: docker, docker: {labels: {shared: {docker: d}}}}`, "needs"},
 		{"an incus provider without a template", `{type: incus, incus: {labels: {shared: {docker: d}}}}`,
 			"config_template"},

@@ -19,6 +19,7 @@ func Settings(c config.Incus, host, container string) *slot.Settings {
 		Snapshot: c.Snapshot, ConfigTemplate: c.ConfigTemplate, ConfigPath: c.ConfigPath,
 		TokenPath: c.TokenPath, RunnerService: c.RunnerService, RunnerUser: c.RunnerUser,
 		WorkDir: c.WorkDir, IdleHours: c.IdleHours, JobHours: c.JobHours, BootTimeout: c.BootTimeout,
+		StopTimeout: c.StopTimeout,
 		LabelTables: c.Labels, CacheVolumes: slot.ExpandVolumes(c.CacheVolumes, host, container), CachePool: c.CachePool, CachePath: c.CachePath}
 	s.Defaults()
 	return s

@@ -45,6 +45,13 @@ type fakeSystem struct {
 	took       bool
 	task       int64
 	peak       int
+	// stopLooks is how many looks a stopped runner stays active, still busy: its job being
+	// cancelled and reported; ignoresStop keeps it active whatever it is sent.
+	stopLooks   int
+	ignoresStop bool
+	// stoppedAt is when the runner was stopped, exitedAt when a look first saw it inactive
+	// after that.
+	stoppedAt, exitedAt time.Time
 }
 
 func (f *fakeSystem) Reset() error {
@@ -77,13 +84,19 @@ func (f *fakeSystem) StartRunner() error {
 
 func (f *fakeSystem) StopRunner() {
 	f.calls = append(f.calls, "stop")
-	f.looks = []look{{false, false}}
+	f.stoppedAt = f.clock.now
+	if !f.ignoresStop {
+		f.looks = append(repeat(look{true, true}, f.stopLooks), look{false, false})
+	}
 }
 
 func (f *fakeSystem) RunnerActive() bool {
 	f.current = look{}
 	if len(f.looks) > 0 {
 		f.current, f.looks = f.looks[0], f.looks[1:]
+	}
+	if !f.current.active && !f.stoppedAt.IsZero() && f.exitedAt.IsZero() {
+		f.exitedAt = f.clock.now
 	}
 	return f.current.active
 }
@@ -294,8 +307,96 @@ func TestALongJobIsCut(t *testing.T) {
 	assign(t, dir, nil)
 	a, _ := c.WaitAssignment()
 	start := sys.clock.now
-	if !c.Serve(a) || sys.clock.now.Sub(start) > 5*time.Hour {
-		t.Fatalf("ran %v", sys.clock.now.Sub(start))
+	if !c.Serve(a) || sys.clock.now.Sub(start) > 5*time.Hour || !slices.Contains(sys.calls, "stop") ||
+		sys.exitedAt.IsZero() {
+		t.Fatalf("ran %v, calls %v", sys.clock.now.Sub(start), sys.calls)
+	}
+}
+
+// A job cut short is stopped through its runner, which then reports the job's end itself:
+// the cycle waits for the runner to exit before it measures and goes on to the reset.
+func TestACutJobsRunnerExitsBeforeTheReset(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: repeat(look{true, true}, 5000), task: 5, peak: 700, stopLooks: 4}
+	c := newCycle(t, dir, sys, sys.clock.stop(100000))
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	write(t, filepath.Join(dir, "run/ci.pause"), PauseStop)
+	if !c.Serve(a) {
+		t.Fatal("serve failed")
+	}
+	stop := slices.Index(sys.calls, "stop")
+	if stop < 0 || slices.Index(sys.calls, "journal") < stop || slices.Index(sys.calls, "measure") < stop {
+		t.Fatalf("calls %v", sys.calls)
+	}
+	// Four looks active, every interval, then the exit; nothing after it.
+	if waited := sys.exitedAt.Sub(sys.stoppedAt); waited != 4*c.interval() || !sys.clock.now.Equal(sys.exitedAt) {
+		t.Fatalf("stopped at %v, exited at %v, now %v", sys.stoppedAt, sys.exitedAt, sys.clock.now)
+	}
+	if last := c.Last(); last.Task != 5 || last.Unused || last.Seconds > 10 {
+		t.Fatalf("last %+v", last)
+	}
+	if !c.Reset() || sys.calls[len(sys.calls)-1] != "reset" {
+		t.Fatalf("calls %v", sys.calls)
+	}
+}
+
+// A runner that does not exit within stop_timeout is left to the reset, which kills it.
+func TestARunnerThatIgnoresTheStopIsLeftToTheReset(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: repeat(look{true, true}, 5000), task: 5, ignoresStop: true}
+	c := newCycle(t, dir, sys, sys.clock.stop(100000))
+	c.settings.StopTimeout = 12
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	write(t, filepath.Join(dir, "run/ci.pause"), PauseStop)
+	if !c.Serve(a) || !slices.Contains(sys.calls, "measure") || c.Last().Task != 5 {
+		t.Fatalf("calls %v, last %+v", sys.calls, c.Last())
+	}
+	if waited := sys.clock.now.Sub(sys.stoppedAt); waited != 12*time.Second {
+		t.Fatalf("waited %v for the runner", waited)
+	}
+}
+
+// A cycle stopped while its runner is being stopped leaves the assignment to the next
+// cycle, which finishes it.
+func TestACycleStoppedWhileItsRunnerStopsLeavesTheAssignment(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: repeat(look{true, true}, 5000), ignoresStop: true}
+	stopping := false
+	c := newCycle(t, dir, sys, func() bool { return stopping })
+	assign(t, dir, nil)
+	a, _ := c.WaitAssignment()
+	write(t, filepath.Join(dir, "run/ci.pause"), PauseStop)
+	c.sleep = func(d time.Duration) {
+		sys.clock.Sleep(d)
+		stopping = !sys.stoppedAt.IsZero()
+	}
+	if !c.Serve(a) || slices.Contains(sys.calls, "measure") || readCycleState(t, dir)["assignment"] != a.ID {
+		t.Fatalf("calls %v, state %v", sys.calls, readCycleState(t, dir))
+	}
+}
+
+// A cycle that starts while the last one's runner is still active (an SSH host's cycle,
+// restarted) stops that runner before it resets the container under it.
+func TestACycleStartsByStoppingTheLastCyclesRunner(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{clock: newClock(), looks: []look{{true, true}}, stopLooks: 2}
+	c := newCycle(t, dir, sys, sys.clock.stop(3))
+	write(t, filepath.Join(dir, "run/ci.json"), `{"assignment": "ci-1-ci-1-7", "job_since": 999000}`)
+	c.Run()
+	if len(sys.calls) < 2 || sys.calls[0] != "stop" || sys.calls[1] != "reset" || sys.exitedAt.IsZero() {
+		t.Fatalf("calls %v", sys.calls)
+	}
+
+	// Without a runner left, the reset comes first.
+	dir = t.TempDir()
+	sys = &fakeSystem{clock: newClock()}
+	c = newCycle(t, dir, sys, sys.clock.stop(3))
+	write(t, filepath.Join(dir, "run/ci.json"), `{"assignment": "ci-1-ci-1-7"}`)
+	c.Run()
+	if len(sys.calls) == 0 || sys.calls[0] != "reset" {
+		t.Fatalf("calls %v", sys.calls)
 	}
 }
 

@@ -128,7 +128,7 @@ server:
 		waitFor("b", provider.Paused)
 		pausedJobs = cycle("b").Jobs
 	}
-	b, logs := scenario(t, fmt.Sprintf(`hosts: [{name: real-e2e, address: %q, memory_mib: 4000, slots: [a, b]}]
+	b, logBuffer := scenario(t, fmt.Sprintf(`hosts: [{name: real-e2e, address: %q, memory_mib: 4000, slots: [a, b]}]
 provider:
   type: incus
   incus:
@@ -210,6 +210,7 @@ provider:
 	}
 
 	// The runner's journal is in the broker's log at info, its task line among it.
+	logs := logBuffer.String()
 	if !strings.Contains(logs, "level=INFO msg=runner") || !strings.Contains(logs, " repo is alice/app") {
 		t.Fatal("no runner journal at info in the log")
 	}
@@ -234,4 +235,12 @@ provider:
 	// Resumed: the slot is reset from its snapshot and ready.
 	berthCommand("resume", "--config", configFile, "real-e2e/b")
 	waitFor("b", provider.Ready)
+
+	// A job that forgejo-berth pause --stop cuts short ends as its runner reports it.
+	cutShort(t, b, logBuffer, hosted.Cycles,
+		func(container string) { berthCommand("pause", "--config", configFile, "--stop", "real-e2e/"+container) },
+		func(container string) {
+			berthCommand("resume", "--config", configFile, "real-e2e/"+container)
+			waitFor(container, provider.Ready)
+		})
 }

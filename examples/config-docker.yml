@@ -68,6 +68,9 @@ provider:
     idle_hours: 24
     job_hours: 4
     boot_timeout: 300
+    # Seconds a runner whose job is cut short has to report the job's end and exit, before
+    # its container is reset under it.
+    stop_timeout: 90
 
 history:
   path: /var/lib/forgejo-berth/history.sqlite

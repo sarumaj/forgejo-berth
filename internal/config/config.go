@@ -229,6 +229,9 @@ type Slots struct {
 	IdleHours    float64           `yaml:"idle_hours"`
 	JobHours     float64           `yaml:"job_hours"`
 	BootTimeout  float64           `yaml:"boot_timeout"`
+	// StopTimeout is how long a runner whose job is cut short has to report the job's end
+	// and exit (seconds), before its container is reset under it.
+	StopTimeout float64 `yaml:"stop_timeout"`
 	// TimeoutSeconds bounds one API request; a long one (a pull, a restore) gets more.
 	TimeoutSeconds float64 `yaml:"timeout_seconds"`
 }
@@ -346,7 +349,7 @@ func setString(v *string, d string) {
 func (c *Config) slotDefaults(s *Slots) {
 	setString(&s.CachePath, "/var/cache/forgejo-runner")
 	for v, d := range map[*float64]float64{&s.IdleHours: 24, &s.JobHours: 4, &s.BootTimeout: 300,
-		&s.TimeoutSeconds: 20} {
+		&s.StopTimeout: 90, &s.TimeoutSeconds: 20} {
 		if *v == 0 {
 			*v = d
 		}
@@ -615,8 +618,9 @@ func (c *Config) checkProvider(fail func(string, ...any)) {
 	if !filepath.IsAbs(slots.CachePath) {
 		fail("%s.cache_path must be an absolute path", where)
 	}
-	if slots.IdleHours < 0 || slots.JobHours < 0 || slots.BootTimeout < 0 || slots.TimeoutSeconds < 0 {
-		fail("%s: idle_hours, job_hours, boot_timeout and timeout_seconds cannot be negative", where)
+	if slots.IdleHours < 0 || slots.JobHours < 0 || slots.BootTimeout < 0 || slots.StopTimeout < 0 ||
+		slots.TimeoutSeconds < 0 {
+		fail("%s: idle_hours, job_hours, boot_timeout, stop_timeout and timeout_seconds cannot be negative", where)
 	}
 	for i, h := range c.Hosts {
 		secure := c.HostTLS(h)
