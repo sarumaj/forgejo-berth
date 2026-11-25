@@ -31,6 +31,29 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+func TestBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra   string
+		runs          int
+		base, maxMins float64
+	}{
+		{"the defaults: three runners, from unused_minutes to four hours", "", 3, 15, 240},
+		{"the base follows unused_minutes", "unused_minutes: 20", 3, 20, 240},
+		{"0 turns it off", "backoff: {unused_runs: 0}", 0, 15, 240},
+		{"set", "backoff: {unused_runs: 2, base_minutes: 5, max_minutes: 60}", 2, 5, 60},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Parse([]byte(minimal + tc.extra + "\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b := c.Backoff; b.Runs() != tc.runs || b.BaseMinutes != tc.base || b.MaxMinutes != tc.maxMins {
+				t.Fatalf("backoff %d %g %g", b.Runs(), b.BaseMinutes, b.MaxMinutes)
+			}
+		})
+	}
+}
+
 func TestUnknownMiBZeroIsKept(t *testing.T) {
 	c, err := Parse([]byte(minimal + "estimate: {unknown_mib: 0}\n"))
 	if err != nil || c.Estimate.Unknown() != 0 {
@@ -48,6 +71,9 @@ func TestWhatIsRefused(t *testing.T) {
 		{"a margin below one", "estimate: {margin: 0.5}", "margin"},
 		{"an owner name with a slash", "trusted: {owners: {a/b: t}, labels: [x]}", "user name"},
 		{"no labels at all", "shared: {labels: []}", "labels"},
+		{"a back-off key unknown", "backoff: {unused: 3}", "unused"},
+		{"negative unused runs", "backoff: {unused_runs: -1}", "backoff"},
+		{"a cap below the base", "backoff: {base_minutes: 30, max_minutes: 10}", "max_minutes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			text := minimal

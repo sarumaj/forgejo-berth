@@ -38,7 +38,7 @@ var learnedEnds = []string{"success", "failure"}
 
 // Events are the counters the broker keeps.
 var Events = []string{"assigned", "learned", "unlearned", "unused", "failed", "underestimated",
-	"released", "would_assign"}
+	"released", "would_assign", "backed_off"}
 
 // Runner is a runner of one of the broker's scopes.
 type Runner struct {
@@ -93,6 +93,10 @@ type Broker struct {
 	released map[string]bool
 	// firstSeen is when each waiting job was first seen (Forgejo does not say since when).
 	firstSeen map[int64]float64
+	// backoffs are the waiting jobs whose runners went unused, by job id; unused the runners
+	// settled unused since the last look at the jobs.
+	backoffs map[int64]Backoff
+	unused   []Assignment
 }
 
 // Options are the broker's collaborators besides the configuration.
@@ -121,6 +125,7 @@ func New(cfg *config.Config, o Options) (*Broker, error) {
 		orphaned:  map[string]int{},
 		released:  map[string]bool{},
 		firstSeen: map[int64]float64{},
+		backoffs:  map[int64]Backoff{},
 	}
 	if b.log == nil {
 		b.log = slog.Default()
@@ -136,6 +141,9 @@ func New(cfg *config.Config, o Options) (*Broker, error) {
 		return nil, err
 	}
 	b.assigned = held
+	if err := b.loadBackoffs(); err != nil {
+		return nil, fmt.Errorf("the kept back-offs: %w", err)
+	}
 	return b, nil
 }
 
@@ -236,6 +244,7 @@ func (b *Broker) Tick(ctx context.Context) error {
 		}
 	}
 	b.firstSeen = firstSeen
+	b.updateBackoffs(jobs, now)
 	b.releaseOrphans(ctx, seen, jobs, now)
 	// The hosts that did not answer get no runner: their slots are unknown.
 	var answered []provider.Slot
@@ -244,11 +253,28 @@ func (b *Broker) Tick(ctx context.Context) error {
 			answered = append(answered, s)
 		}
 	}
+	// A job tried again after a back-off waits from its end, for the order and the
+	// starvation: it arrives anew, as a job run again does.
 	waited := func(j Job) float64 {
-		if t, ok := b.firstSeen[j.ID]; ok {
-			return now - t
+		t, ok := b.firstSeen[j.ID]
+		if !ok {
+			return 0
 		}
-		return 0
+		if e, ok := b.backoffs[j.ID]; ok && e.Until > t {
+			t = e.Until
+		}
+		return max(now-t, 0)
+	}
+	// A backed-off job is not scheduled: it gets no runner, no runner on its way claims it,
+	// no new runner reserves for it, and it holds no host. It stays a candidate of the
+	// runners that cover it, so that the job they run is found if Forgejo hands it out.
+	var active, held []Job
+	for _, j := range jobs {
+		if b.backedOff(j.ID, now) {
+			held = append(held, j)
+		} else {
+			active = append(active, j)
+		}
 	}
 	reserve := func(j Job) (int, bool) {
 		peak, source, found := b.estimate(j, now)
@@ -258,7 +284,12 @@ func (b *Broker) Tick(ctx context.Context) error {
 	if b.cfg.CPU.Overcommit > 0 {
 		cores = func(j Job) float64 { return b.cores(j, now) }
 	}
-	for _, p := range Schedule(jobs, answered, b.assignments(), reserve, b.cfg, waited, cores) {
+	for _, p := range Schedule(active, answered, b.assignments(), reserve, b.cfg, waited, cores) {
+		for _, j := range held {
+			if Covers(Offer{Scope: p.Scope, Labels: p.Labels}, j) {
+				p.Candidates = append(p.Candidates, j)
+			}
+		}
 		b.start(ctx, p, now)
 	}
 	b.publish(now, len(jobs), unservable, sources)
@@ -316,6 +347,7 @@ func (b *Broker) settle(ctx context.Context, s provider.Slot, now float64) {
 	where := []any{"host", s.Host, "container", s.Container, "assignment", a.ID}
 	if s.Unused {
 		b.counts["unused"]++
+		b.noteUnused(a, now)
 		b.delete(ctx, a)
 		return
 	}
@@ -341,6 +373,7 @@ func (b *Broker) settle(ctx context.Context, s provider.Slot, now float64) {
 		return
 	}
 	where = append(where, "repo", job.Repo, "job", job.Name)
+	b.ranJob(job)
 	if !slices.Contains(learnedEnds, end) {
 		if end == "" {
 			end = "unknown"
@@ -377,12 +410,13 @@ func (b *Broker) settle(ctx context.Context, s provider.Slot, now float64) {
 }
 
 // releaseOrphans releases the runners still idle whose jobs no longer wait (deleted,
-// cancelled, taken by another runner): the slot is free again in a minute instead of after
-// unused_minutes. The slot's cycle decides: a runner that took a job meanwhile goes on.
+// cancelled, taken by another runner) or are backed off: the slot is free again in a minute
+// instead of after unused_minutes. The slot's cycle decides: a runner that took a job
+// meanwhile goes on.
 func (b *Broker) releaseOrphans(ctx context.Context, seen []provider.Slot, jobs []Job, now float64) {
 	waiting := map[int64]bool{}
 	for _, j := range jobs {
-		waiting[j.ID] = true
+		waiting[j.ID] = !b.backedOff(j.ID, now)
 	}
 	idle := map[[2]string]bool{}
 	for _, s := range seen {

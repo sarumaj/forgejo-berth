@@ -26,6 +26,8 @@ type State struct {
 	Counts      map[string]int       `json:"counts"`
 	Estimates   map[string]int       `json:"estimates"`
 	JobsLearned int                  `json:"jobs_learned"`
+	// Backoffs are the waiting jobs whose runners went unused, held back or counting.
+	Backoffs []BackoffState `json:"backoffs"`
 	// Cycles are the slots' reset cycles the broker runs itself (the docker and incus
 	// providers); an SSH host's cycles write their own metrics on the host.
 	Cycles []provider.CycleStats `json:"cycles,omitempty"`
@@ -49,6 +51,30 @@ type AssignmentState struct {
 	Since      int64    `json:"since"`
 }
 
+// BackoffState is a job's back-off as the state shows it.
+type BackoffState struct {
+	JobID int64  `json:"job_id"`
+	RunID int64  `json:"run_id"`
+	Repo  string `json:"repo"`
+	Name  string `json:"name"`
+	// Unused counts the runners in a row that went unused while it waited.
+	Unused int `json:"unused"`
+	// BackedOff tells whether it is held back now, Until until when (0: never backed off).
+	BackedOff bool  `json:"backed_off"`
+	Until     int64 `json:"until"`
+}
+
+// BackedOff counts the jobs held back now.
+func (s State) BackedOff() int {
+	n := 0
+	for _, e := range s.Backoffs {
+		if e.BackedOff {
+			n++
+		}
+	}
+	return n
+}
+
 var estimateSources = []string{"job", "family", "repo", "none"}
 
 func (b *Broker) publish(now float64, waiting, unservable int, sources map[string]int) {
@@ -66,6 +92,12 @@ func (b *Broker) publish(now float64, waiting, unservable int, sources map[strin
 		Counts:      maps.Clone(b.counts),
 		Estimates:   map[string]int{},
 		JobsLearned: known,
+		Backoffs:    []BackoffState{},
+	}
+	for _, id := range slices.Sorted(maps.Keys(b.backoffs)) {
+		e := b.backoffs[id]
+		s.Backoffs = append(s.Backoffs, BackoffState{JobID: id, RunID: e.Job.RunID, Repo: e.Job.Repo,
+			Name: e.Job.Name, Unused: e.Unused, BackedOff: e.active(now), Until: int64(e.Until)})
 	}
 	for _, src := range estimateSources {
 		s.Estimates[src] = sources[src]
@@ -126,7 +158,7 @@ func (s State) Metrics() string {
 	for _, h := range hosts {
 		fmt.Fprintf(&w, "forgejo_berth_reserved_mib{host=%q} %d\n", h, s.Hosts[h].ReservedMiB)
 	}
-	metric("events_total", "counter", "Runners assigned, jobs learned or not, runners unused, failures.")
+	metric("events_total", "counter", "Runners assigned, jobs learned or not, runners unused, failures, jobs backed off.")
 	for _, e := range slices.Sorted(maps.Keys(s.Counts)) {
 		fmt.Fprintf(&w, "forgejo_berth_events_total{event=%q} %d\n", e, s.Counts[e])
 	}
@@ -136,6 +168,8 @@ func (s State) Metrics() string {
 	}
 	metric("jobs_learned", "gauge", "Jobs with a memory history.")
 	fmt.Fprintf(&w, "forgejo_berth_jobs_learned %d\n", s.JobsLearned)
+	metric("backed_off_jobs", "gauge", "Waiting jobs held back because their runners went unused.")
+	fmt.Fprintf(&w, "forgejo_berth_backed_off_jobs %d\n", s.BackedOff())
 	w.WriteString(provider.CycleMetrics(s.Cycles))
 	return w.String()
 }

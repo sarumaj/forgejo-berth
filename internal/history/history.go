@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS runs (repo TEXT NOT NULL, name TEXT NOT NULL, family 
 CREATE INDEX IF NOT EXISTS runs_job ON runs (repo, name, at);
 CREATE INDEX IF NOT EXISTS runs_family ON runs (repo, family, at);
 CREATE TABLE IF NOT EXISTS assignments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backoffs (job INTEGER PRIMARY KEY, data TEXT NOT NULL);
 `
 
 // cpuColumns are added to a database made before forgejo-berth recorded CPU use; a run
@@ -268,6 +269,43 @@ func (h *History) Held() (map[string][]byte, error) {
 			return nil, err
 		}
 		found[id] = []byte(data)
+	}
+	return found, rows.Err()
+}
+
+// KeepBackoff keeps the back-off of a waiting job (by its id) until it is forgotten.
+func (h *History) KeepBackoff(job int64, data []byte) error {
+	if h.readOnly {
+		return ErrReadOnly
+	}
+	_, err := h.db.Exec("INSERT OR REPLACE INTO backoffs VALUES (?, ?)", job, string(data))
+	return err
+}
+
+// ForgetBackoff forgets a job's back-off.
+func (h *History) ForgetBackoff(job int64) error {
+	if h.readOnly {
+		return ErrReadOnly
+	}
+	_, err := h.db.Exec("DELETE FROM backoffs WHERE job = ?", job)
+	return err
+}
+
+// Backoffs returns the data of every back-off kept, by job id.
+func (h *History) Backoffs() (map[int64][]byte, error) {
+	rows, err := h.db.Query("SELECT job, data FROM backoffs")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	found := map[int64][]byte{}
+	for rows.Next() {
+		var job int64
+		var data string
+		if err := rows.Scan(&job, &data); err != nil {
+			return nil, err
+		}
+		found[job] = []byte(data)
 	}
 	return found, rows.Err()
 }

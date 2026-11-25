@@ -100,9 +100,11 @@ The broker is one loop. Every `interval_seconds` it:
 3. forgets assignments no slot reports any more (after 90 seconds), and at once those on hosts
    removed from the configuration; their runners are deleted;
 4. reads the waiting jobs (`GET /api/v1/admin/runners/jobs`), prunes the history once a day,
-   releases idle runners none of whose jobs wait any more;
-5. schedules: for each waiting job in arrival order, picks a slot and starts a runner there
-   (register, keep the assignment, `Provider.Assign`);
+   counts the runners settled unused against the jobs that still wait and backs those off that
+   reached the limit ([Back-off](#back-off)), releases idle runners none of whose jobs wait any
+   more;
+5. schedules: for each waiting job not backed off, in arrival order, picks a slot and starts a
+   runner there (register, keep the assignment, `Provider.Assign`);
 6. publishes its state and metrics.
 
 At start it sweeps the runners whose name has the configured prefix and that no kept assignment
@@ -606,10 +608,56 @@ A job that does not fit lets younger, smaller jobs go ahead until it has waited
 `starve_minutes` (10). Then it holds the fitting host with the most memory free: nothing new
 starts there until the job fits.
 
+### Back-off
+
+Forgejo may list a job as waiting and still hand it to no runner: a run held by its concurrency
+group behind an earlier run that never ends, for example. The API berth reads shows neither the
+group nor the reason. Without a rule, berth would start a runner for the job, the runner would
+wait `unused_minutes` for nothing, and the next look would start the next one: a slot and a
+reservation taken for as long as the job waits, for hours.
+
+berth tells such a job from its own history. A runner that went unused counts against every job
+it covered (its candidates) that still waits: Forgejo handed none of them to a runner that asked
+for `unused_minutes`. A runner stopped sooner (released, its slot paused) proves nothing and does
+not count, nor does a lost one. After `backoff.unused_runs` (3) such runners in a row the job is
+**backed off** for `backoff.base_minutes` (default `unused_minutes`); each runner gone unused
+after it is tried again doubles that, up to `backoff.max_minutes` (240): 15, 30, 60, 120, then
+240 minutes with the defaults. `unused_runs: 0` turns the back-off off.
+
+While backed off, a job:
+
+- gets no runner, and no runner on its way claims it: such a runner claims the next job it
+  covers instead;
+- is reserved for by no new runner, and does not hold a host when it starves;
+- keeps no runner from its release: a runner whose other jobs went is released as usual;
+- stays a candidate of the runners that cover it, an owner's job under a global runner too (see
+  [Claims](#claims-and-reservations)). A back-off belongs to the job's id, whichever scope's
+  runner would take it: if Forgejo hands the job out after all, it is found among the
+  candidates, and the back-off ends.
+
+When the back-off ends, the job is tried again as if it arrived then: its place in the order and
+its wait for the starvation count from that moment. The count goes back to 0 when a runner
+takes the job (whatever its end), and the back-off is forgotten when the job waits no more (it
+ran, was cancelled, its run deleted); a job run again arrives anew.
+
+The log has one line for each step: `backed off` (warn: the job, its run, the count, the
+minutes and until when), `back-off over; the job is tried again`, `a backed-off job ran;
+back-off reset`, `a backed-off job waits no more; back-off forgotten`.
+
+The back-offs are kept in the history (the `backoffs` table, by job id), written at each change
+and read at start, as the kept assignments are: a restart neither forgets a back-off nor starts
+the churn anew, and those of jobs that went meanwhile are forgotten at the first look. The state
+file would not do: it is an output, optional, and not read back.
+
+Runners that cannot reach Forgejo at all go unused too, and back every job off after a while:
+the back-off then slows the churn of a broken setup as well. `unused` rising without `learned`
+shows that case.
+
 ### Release and loss
 
 - An assigned runner none of whose candidate jobs waits any more (cancelled, deleted, taken by
-  another runner) is released once it is 60 seconds old and seen so at two looks in a row.
+  another runner) or all of whose waiting ones are backed off is released once it is 60 seconds
+  old and seen so at two looks in a row.
 - The slot's cycle stops a runner unused for `unused_minutes` (15) anyway.
 - An assignment no slot reports for 90 seconds is lost (its cycle restarted before taking it);
   its runner is deleted. One on a host no longer configured is lost at once.
@@ -627,10 +675,12 @@ starts there until the job fits.
   | `forgejo_berth_events_total`      | `event`  | counter |
   | `forgejo_berth_estimates`         | `source` | gauge   |
   | `forgejo_berth_jobs_learned`      |          | gauge   |
+  | `forgejo_berth_backed_off_jobs`   |          | gauge   |
   | `forgejo_berth_shadow`            |          | gauge   |
 
   Events: `assigned`, `learned`, `unlearned`, `unused`, `failed`, `underestimated`, `released`,
-  and in shadow mode `would_assign`.
+  `backed_off` (each back-off, the first and each longer one), and in shadow mode
+  `would_assign`.
 - The reset cycles' metrics, one series per slot:
 
   | Metric                                   | Labels                         | Kind    |
@@ -647,8 +697,9 @@ starts there until the job fits.
   several hosts). `jobs_total` counts since the cycle started on an SSH host; a broker's cycle
   resumes its count from the state file. A shadow broker runs no cycles and has none.
 - `GET /state`: JSON (`last_tick`, `waiting`, `unservable`, `hosts` with `reachable` and
-  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`, and
-  `cycles`, the broker's own cycles as their metrics show them). The same
+  `reserved_mib`, `assignments` without tokens, `counts`, `estimates`, `jobs_learned`,
+  `backoffs` (each job counted: `job_id`, `run_id`, `repo`, `name`, `unused`, `backed_off`,
+  `until`), and `cycles`, the broker's own cycles as their metrics show them). The same
   document can be written to `state_file` atomically, for tools that read files, and the
   metrics to `metrics_file` (a node_exporter textfile collector's `.prom` file).
 - `GET /healthz`: 200 while the last look is younger than three intervals.
@@ -674,7 +725,10 @@ starts there until the job fits.
 
 `forgejo-berth run --shadow` (or `shadow: true`) runs every look but acts on nothing: it
 registers, assigns, releases and deletes no runner, sweeps nothing and records no run. It logs
-each placement it would make (`would assign`) and counts them.
+each placement it would make (`would assign`) and counts them. It computes the
+[back-offs](#back-off) itself, in memory, from the runners it sees settled (the live
+instance's, each counted once however often it sees it), logs `would back off` and leaves
+backed-off jobs out of its placements; it neither reads nor writes the live instance's.
 
 The history is opened read-only in shadow mode, and the kept assignments are read from it at
 every look. A shadow instance can therefore point `history.path` at the database of a live
@@ -687,13 +741,16 @@ CREATE TABLE runs (repo TEXT NOT NULL, name TEXT NOT NULL, family TEXT NOT NULL,
   at REAL NOT NULL, peak_mib INTEGER NOT NULL, reserved_mib INTEGER NOT NULL,
   seconds REAL NOT NULL, host TEXT NOT NULL, cpu_cores REAL, cpu_pressure REAL);
 CREATE TABLE assignments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE backoffs (job INTEGER PRIMARY KEY, data TEXT NOT NULL);
 ```
 
 `at` is Unix seconds. `data` is the assignment as JSON: `id`, `host`, `container`, `scope`,
 `runner_id`, `labels`, `candidates` (jobs: `id`, `run_id`, `repo_id`, `owner`, `repo`, `name`,
 `runs_on`), `reserve_mib`, `exclusive`, `since`, and `reserve_cores` when the CPU admission is
-on. A database without the CPU columns gets them when berth opens it for writing; read-only, it
-is used without CPU figures.
+on. A `backoffs` row's `data` is a job's back-off as JSON: `job` (as a candidate), `unused`,
+`until` (Unix seconds, 0 before the first back-off), `last` (the assignment last counted) and
+`retried`. A database without the CPU columns or the `backoffs` table gets them when berth opens
+it for writing; read-only, it is used without CPU figures.
 
 Taking over: stop the live instance, start berth on its history without `--shadow`. The kept
 assignments carry over (set `runner_prefix` to the old instance's prefix so the sweep spares
@@ -718,8 +775,8 @@ runner after its job). Tested against Forgejo 17 and forgejo-runner 13.
 
 ## Testing
 
-- The scheduler, the estimate and the broker's look are tested table-driven, with a fake forge
-  and a fake provider, on a fake clock.
+- The scheduler, the estimate, the broker's look and the back-off are tested table-driven, with
+  a fake forge and a fake provider, on a fake clock.
 - The Forgejo client is tested against an `httptest` server that serves the API's shapes.
 - An end-to-end test runs the broker against a fake Forgejo (`httptest`) and an in-memory
   provider that plays the slot's life: ready, assigned, running, finished with a peak, learned,

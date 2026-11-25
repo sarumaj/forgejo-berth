@@ -56,6 +56,13 @@ cpu:
   overcommit: 0
   unknown_cores: 1
 
+# A job whose runners keep going unused while it waits (Forgejo lists it but hands it to no
+# runner, as a run held by its concurrency group) is held back after unused_runs runners in a
+# row: base_minutes (default: unused_minutes), doubled at each further one, up to max_minutes.
+backoff:
+  unused_runs: 3
+  max_minutes: 240
+
 history:
   path: /var/lib/forgejo-berth/history.sqlite
 
