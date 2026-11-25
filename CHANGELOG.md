@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The release bot
 writes each version's section from the commits (Conventional Commits) and the hand-written
 Unreleased section.
 
+## 0.4.0 - 2026-11-25
+
+### Added
+
+- back off a waiting job whose runners keep going unused
+
 ## 0.3.0 - 2026-11-24
 
 ### Added
