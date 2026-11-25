@@ -55,6 +55,7 @@ type Config struct {
 	Provider Provider `yaml:"provider"`
 	Estimate Estimate `yaml:"estimate"`
 	CPU      CPU      `yaml:"cpu"`
+	Backoff  Backoff  `yaml:"backoff"`
 	History  History  `yaml:"history"`
 
 	// IntervalSeconds is the time between two looks at the jobs and the slots.
@@ -293,6 +294,27 @@ type Estimate struct {
 	RetentionDays float64 `yaml:"retention_days"`
 }
 
+// Backoff holds back a waiting job whose runners keep going unused: Forgejo lists it as
+// waiting but hands it to no runner (a run held by its concurrency group, say), which berth
+// cannot see through the API it uses.
+type Backoff struct {
+	// UnusedRuns is how many runners in a row that could take the job must go unused, the
+	// job waiting all the while, before it is held back; 0 turns the back-off off.
+	UnusedRuns *int `yaml:"unused_runs"`
+	// BaseMinutes is the first back-off (default: unused_minutes); each further runner gone
+	// unused doubles it, up to MaxMinutes.
+	BaseMinutes float64 `yaml:"base_minutes"`
+	MaxMinutes  float64 `yaml:"max_minutes"`
+}
+
+// Runs returns how many unused runners in a row hold a job back (0: never).
+func (b Backoff) Runs() int {
+	if b.UnusedRuns == nil {
+		return 0
+	}
+	return *b.UnusedRuns
+}
+
 // History is where runs and kept assignments are stored.
 type History struct {
 	Path string `yaml:"path"`
@@ -411,6 +433,12 @@ func (c *Config) defaults() {
 	}
 	setFloat(&e.RetentionDays, 180)
 	setFloat(&c.CPU.UnknownCores, 1)
+	if c.Backoff.UnusedRuns == nil {
+		runs := 3
+		c.Backoff.UnusedRuns = &runs
+	}
+	setFloat(&c.Backoff.BaseMinutes, c.UnusedMinutes)
+	setFloat(&c.Backoff.MaxMinutes, 240)
 	if c.History.Path == "" {
 		c.History.Path = "/var/lib/forgejo-berth/history.sqlite"
 	}
@@ -485,6 +513,9 @@ func (c *Config) check() error {
 	}
 	if c.CPU.Overcommit < 0 || c.CPU.UnknownCores < 0 {
 		fail("cpu: overcommit and unknown_cores cannot be negative")
+	}
+	if bo := c.Backoff; bo.Runs() < 0 || bo.BaseMinutes < 0 || bo.MaxMinutes < bo.BaseMinutes {
+		fail("backoff: unused_runs and base_minutes cannot be negative, max_minutes not below base_minutes")
 	}
 	if c.UnusedMinutes < 1 || c.UnusedMinutes > 24*60 {
 		fail("unused_minutes must be between 1 and 1440")

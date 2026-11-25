@@ -131,6 +131,56 @@ func TestAssignmentsAreKeptAcrossOpens(t *testing.T) {
 	}
 }
 
+func TestBackoffsAreKeptAcrossOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.sqlite")
+	h, err := Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range []int64{7, 8} {
+		if err := h.KeepBackoff(job, []byte(`{"unused":3}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.ForgetBackoff(8); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.Close()
+	h, err = Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	kept, err := h.Backoffs()
+	if err != nil || len(kept) != 1 || string(kept[7]) != `{"unused":3}` {
+		t.Fatalf("Backoffs = %v, %v", kept, err)
+	}
+}
+
+func TestAnOlderDatabaseGetsTheBackoffTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.sqlite")
+	old, err := Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as it was before the back-off was kept.
+	if _, err := old.db.Exec("DROP TABLE backoffs"); err != nil {
+		t.Fatal(err)
+	}
+	_ = old.Close()
+	h, err := Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if err := h.KeepBackoff(7, []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := h.Backoffs(); err != nil || len(kept) != 1 {
+		t.Fatalf("Backoffs = %v, %v", kept, err)
+	}
+}
+
 func TestReadOnlyNeedsAnExistingDatabase(t *testing.T) {
 	if _, err := Open(filepath.Join(t.TempDir(), "missing.sqlite"), true); err == nil {
 		t.Fatal("opened a missing database read-only")

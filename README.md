@@ -65,6 +65,10 @@ sequenceDiagram
   hand it: the oldest waiting job its scope and labels cover, which for a global runner can be
   an owner's job, or an older one if it asks before the runners started for those. A job that
   does not fit lets smaller ones pass for 10 minutes, then holds a host until it fits.
+- **Back-off.** A job Forgejo lists as waiting but hands to no runner (a run held by its
+  concurrency group, say) would get one idle runner after another. After 3 runners in a row
+  that could take it went unused, berth holds it back for `unused_minutes`, doubling at each
+  further unused runner up to 4 hours, until it runs or waits no more.
 - **CPU.** Every job's average cores and CPU pressure are recorded. An optional rule keeps a
   host's predicted cores within its cores times an overcommit factor, or caps its jobs.
 
@@ -231,6 +235,9 @@ path is looked up in `$CREDENTIALS_DIRECTORY` when set (systemd's `LoadCredentia
 | `estimate.retention_days`         | 180                                     | runs older are forgotten                                                                |
 | `cpu.overcommit`                  | 0 (off)                                 | predicted cores within `cpu_cores` times this                                           |
 | `cpu.unknown_cores`               | 1                                       | cores predicted for a job without CPU history                                           |
+| `backoff.unused_runs`             | 3                                       | runners in a row gone unused that hold a waiting job back; 0: off                       |
+| `backoff.base_minutes`            | `unused_minutes`                        | the first back-off, doubled for each further unused runner                              |
+| `backoff.max_minutes`             | 240                                     | the longest back-off                                                                    |
 | `history.path`                    | `/var/lib/forgejo-berth/history.sqlite` | runs and kept assignments                                                               |
 | `interval_seconds`                | 10                                      | between looks                                                                           |
 | `unused_minutes`                  | 15                                      | a runner without a job is stopped after that                                            |
@@ -390,21 +397,24 @@ default `state_dir` is under `/run`: a pause there does not survive the host's r
 - `GET /metrics`: `forgejo_berth_last_tick_seconds`, `forgejo_berth_waiting_jobs{kind}`,
   `forgejo_berth_host_reachable{host}`, `forgejo_berth_reserved_mib{host}`,
   `forgejo_berth_events_total{event}` (`assigned`, `learned`, `unlearned`, `unused`, `failed`,
-  `underestimated`, `released`, `would_assign`), `forgejo_berth_estimates{source}`,
-  `forgejo_berth_jobs_learned`, `forgejo_berth_shadow`. Each slot's reset cycle has
-  `forgejo_berth_cycle_state{container,state}`, `forgejo_berth_cycle_jobs_total{container}`,
+  `underestimated`, `released`, `would_assign`, `backed_off`), `forgejo_berth_estimates{source}`,
+  `forgejo_berth_jobs_learned`, `forgejo_berth_backed_off_jobs`, `forgejo_berth_shadow`. Each
+  slot's reset cycle has `forgejo_berth_cycle_state{container,state}`,
+  `forgejo_berth_cycle_jobs_total{container}`,
   `forgejo_berth_cycle_failures{container}` and `forgejo_berth_cycle_last_reset_seconds{container}`:
   on an SSH host the cycle writes them to a node_exporter textfile directory when one is set
   (`textfile_dir`); with the `docker` and `incus` providers they are part of the broker's
   metrics (and `metrics_file`), with a `host` label.
 - `GET /state`: the hosts' reachability and reservations, the assignments (no tokens), the
-  counters and the estimates' sources, and the cycles the broker runs (`cycles`).
+  counters and the estimates' sources, the jobs' back-offs (`backoffs`), and the cycles the
+  broker runs (`cycles`).
 - `GET /healthz`: 200 while the last look is recent.
 - Logs: structured (`log/slog`), one line per decision.
 
 Alerts worth having: no look for 5 minutes; a host unreachable for 10; more than a few
 `underestimated` a day (margins too small); `unlearned` without `learned` for hours (the
-runner's task line changed).
+runner's task line changed); a job backed off for hours (`forgejo_berth_backed_off_jobs`, the
+log's `backed off` line names it: a run stuck in Forgejo, or runners that cannot reach it).
 
 ## Security
 
@@ -429,7 +439,7 @@ runner's task line changed).
 `--shadow` reads everything and acts on nothing: no runner registered, assigned, released or
 deleted, nothing recorded. It opens the history read-only and reads the kept assignments at
 every look, so it can point at the database of a live instance and log the decisions it would
-take (`would assign`) next to the live ones.
+take (`would assign`, `would back off`) next to the live ones.
 
 ## Building
 
