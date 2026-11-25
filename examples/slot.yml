@@ -30,5 +30,9 @@ cache_path: /var/cache/forgejo-runner
 idle_hours: 24
 job_hours: 4
 boot_timeout: 300
+# Seconds a runner whose job is cut short (over job_hours, the slot paused at once) has to
+# report the job's end and exit before the reset kills it: the runner unit's TimeoutStopSec
+# should be at least that.
+stop_timeout: 90
 state_dir: /run/forgejo-berth
 textfile_dir: /var/lib/node_exporter/textfile

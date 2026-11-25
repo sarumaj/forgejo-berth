@@ -17,7 +17,8 @@ import (
 func Settings(s config.Slots, host, name string) *slot.Settings {
 	settings := &slot.Settings{Container: name, StateDir: filepath.Join(s.StateDir, host),
 		LabelTables: s.Labels, ConfigTemplate: s.ConfigTemplate, CacheVolumes: slot.ExpandVolumes(s.CacheVolumes, host, name),
-		CachePath: s.CachePath, IdleHours: s.IdleHours, JobHours: s.JobHours, BootTimeout: s.BootTimeout}
+		CachePath: s.CachePath, IdleHours: s.IdleHours, JobHours: s.JobHours, BootTimeout: s.BootTimeout,
+		StopTimeout: s.StopTimeout}
 	settings.Defaults()
 	return settings
 }

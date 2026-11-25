@@ -32,7 +32,8 @@ type System interface {
 	Apply(a provider.Parsed) error
 	// StartRunner starts the runner's service.
 	StartRunner() error
-	// StopRunner asks the runner to stop (it has no job), without waiting.
+	// StopRunner asks the runner to stop, without waiting: a signal that lets it cancel its
+	// job and report the job's end to Forgejo before it exits.
 	StopRunner()
 	// RunnerActive tells whether the runner's service has processes.
 	RunnerActive() bool
@@ -124,9 +125,16 @@ func (c *Cycle) interval() time.Duration {
 // reset and then held until it is resumed; a slot the last cycle held paused, and still
 // paused, is held at once, its container not reset.
 func (c *Cycle) Run() {
-	held := c.saved().Held
+	saved := c.saved()
+	held := saved.Held
 	if c.resume && !c.Resume() {
 		c.backOff()
+	} else if !c.resume && provider.AssignmentID.MatchString(saved.Assignment) && c.system.RunnerActive() {
+		// The last cycle's runner, its job perhaps running: stopped before the reset, so
+		// that its job's end reaches Forgejo.
+		c.log.Warn("the last cycle's runner is still active; stopped before the reset",
+			"assignment", saved.Assignment)
+		c.stopRunner()
 	}
 	if paused, _ := c.pauseRequest(); held && paused {
 		c.holdPaused()
@@ -279,8 +287,9 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 	c.assignment, c.servedSince, c.jobSince, c.unusedMinutes = a.ID, started, jobSince, a.UnusedMinutes
 	c.write()
 	lastLook := started
-	// pausedOut: the runner was stopped for a pause, not failed.
-	pausedOut := false
+	// pausedOut: the runner was stopped for a pause, not failed; cut: the runner is to be
+	// stopped (its job cut short, or no job came).
+	pausedOut, cut := false, false
 	for {
 		c.sleep(c.interval())
 		if c.stopping() {
@@ -315,20 +324,27 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 				c.jobStarted()
 			} else if why != "" {
 				c.log.Info("stops its runner, which has no job", "why", why)
-				c.system.StopRunner()
+				cut = true
 				break
 			}
 		} else if now.Sub(jobSince).Hours() > c.settings.JobHours {
-			c.log.Warn("its job ran too long; reset", "hours", c.settings.JobHours)
+			c.log.Warn("its job ran too long; stopped", "hours", c.settings.JobHours)
+			cut = true
 			break
 		} else if paused, stop := c.pauseRequest(); paused && stop {
-			c.log.Warn("its job is stopped: the slot is paused at once; reset")
+			c.log.Warn("its job is stopped: the slot is paused at once")
+			cut = true
 			break
 		}
 	}
-	failed := jobSince.IsZero() && c.now().Sub(started).Seconds() < quickExit && !pausedOut
+	ended := c.now()
+	if cut && !c.stopRunner() {
+		// Stopping: the runner ends on its own, and the next cycle finishes the assignment.
+		return true
+	}
+	failed := jobSince.IsZero() && ended.Sub(started).Seconds() < quickExit && !pausedOut
 	c.system.SaveJournal(failed)
-	c.finish(a, jobSince, c.now())
+	c.finish(a, jobSince, ended)
 	if !jobSince.IsZero() {
 		c.jobs++
 		c.failures = 0
@@ -342,6 +358,31 @@ func (c *Cycle) watch(a provider.Parsed, started, jobSince time.Time) bool {
 		return false
 	}
 	c.failures = 0
+	return true
+}
+
+// stopRunner stops the runner and waits, up to stop_timeout, for it to exit. Stopped so, a
+// runner cancels its job and reports the job's end to Forgejo itself; a container reset
+// under a running job leaves the task to Forgejo's reaper of tasks whose runner went, which
+// does not resolve the jobs that need it. A runner still active after stop_timeout is left
+// to the reset, which kills it. False when the cycle is stopping meanwhile.
+func (c *Cycle) stopRunner() bool {
+	c.system.StopRunner()
+	since := c.now()
+	grace := time.Duration(c.settings.StopTimeout * float64(time.Second))
+	for c.system.RunnerActive() {
+		if c.stopping() {
+			return false
+		}
+		waited := c.now().Sub(since)
+		if waited >= grace {
+			c.log.Warn("the runner did not exit within stop_timeout; the reset kills it",
+				"stop_timeout", c.settings.StopTimeout)
+			return true
+		}
+		c.sleep(min(c.interval(), grace-waited))
+	}
+	c.log.Info("the runner exited when stopped", "seconds", math.Round(c.now().Sub(since).Seconds()))
 	return true
 }
 

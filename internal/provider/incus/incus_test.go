@@ -43,14 +43,16 @@ const (
 // ci: sync answers, background operations waited for at /1.0/operations/{id}/wait, exec
 // with record-output (its logs under /1.0/instances/ci/logs/exec-output/), the file API.
 type fakeIncus struct {
-	mu        sync.Mutex
-	calls     []string
-	status    string
-	devices   map[string]map[string]string
-	files     map[string]string
-	logs      map[string]string
-	ops       map[string]map[string]any
-	runner    string
+	mu      sync.Mutex
+	calls   []string
+	status  string
+	devices map[string]map[string]string
+	files   map[string]string
+	logs    map[string]string
+	ops     map[string]map[string]any
+	runner  string
+	// stopLooks is how many looks a runner stopped through systemctl is still busy.
+	stopLooks int
 	cgroup    string
 	journal   string
 	peak      int64
@@ -104,7 +106,18 @@ func (f *fakeIncus) exec(command []string) (string, string, int) {
 	case strings.Contains(line, "is-system-running"):
 		return "running\n", "", 0
 	case strings.HasSuffix(line, "look forgejo-runner.service /var/lib/forgejo-runner/work"):
+		if f.runner == "stopping" {
+			if f.stopLooks > 0 {
+				f.stopLooks--
+				return "busy\n", "", 0
+			}
+			f.runner = "inactive"
+			f.calls = append(f.calls, "runner exited")
+		}
 		return f.runner + "\n", "", 0
+	case line == "systemctl stop --no-block forgejo-runner.service":
+		f.runner = "stopping"
+		return "", "", 0
 	case strings.Contains(line, "/sys/fs/cgroup 2>/dev/null"):
 		return f.cgroup, "", 0
 	case command[0] == "journalctl":
@@ -621,5 +634,54 @@ func TestTheRunnersJournalIsInTheLog(t *testing.T) {
 	system.SaveJournal(true)
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "not running") {
 		t.Fatalf("log of a failed runner whose container stopped:\n%s", logs.String())
+	}
+}
+
+// A job cut short (the slot paused at once) is stopped through the runner's service: the
+// container is stopped for its reset only after the runner exited, having reported the
+// job's end itself.
+func TestACutJobsRunnerExitsBeforeTheContainerStops(t *testing.T) {
+	f := newFakeIncus()
+	f.status = "Running"
+	f.runner = "busy"
+	f.stopLooks = 3
+	f.journal = `Nov 23 runner[1]: time="x" level=info msg="task 8480 repo is alice/app https://data.forgejo.org https://forgejo.example.org"` + "\n"
+	client, _, _ := serveTLS(t, f)
+	s := testSettings(t)
+	instance := NewInstance(client, "ci", 5*time.Second)
+	system := slot.NewIncusOn(s, instance)
+	system.Log = slog.New(slog.DiscardHandler)
+	now := time.Unix(1_000_000, 0)
+	c := slot.NewCycle(s, system, slot.CycleOptions{Log: system.Log,
+		Now: func() time.Time { return now },
+		Sleep: func(d time.Duration) {
+			now = now.Add(d)
+			// Every look of the fake clock's is a new one.
+			instance.mu.Lock()
+			instance.lookedAt = time.Time{}
+			instance.mu.Unlock()
+		}})
+	handoff := `{"assignment": "ci-1-ci-7-42", "uuid": "` + testUUID + `", "token": "` + testToken +
+		`", "labels": ["docker"], "class": "shared", "unused_minutes": 15}`
+	if err := os.MkdirAll(s.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"ci.assignment": handoff, "ci.pause": slot.PauseStop} {
+		if err := os.WriteFile(filepath.Join(s.StateDir, name), []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, ok := c.WaitAssignment()
+	if !ok || !c.Serve(a) || c.Last().Task != 8480 {
+		t.Fatalf("served %v, last %+v", ok, c.Last())
+	}
+	if !c.Reset() {
+		t.Fatal("the reset failed")
+	}
+	stop := slices.Index(f.calls, "exec systemctl stop --no-block forgejo-runner.service")
+	exited := slices.Index(f.calls, "runner exited")
+	stopped := slices.Index(f.calls, "state stop force=true")
+	if stop < 0 || exited < stop || stopped < exited {
+		t.Fatalf("calls %v", f.calls)
 	}
 }

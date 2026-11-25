@@ -20,9 +20,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"git.ciepiela.org/dawid/forgejo-berth/internal/config"
 	"git.ciepiela.org/dawid/forgejo-berth/internal/provider"
+	"git.ciepiela.org/dawid/forgejo-berth/internal/slot"
 )
 
 const (
@@ -38,6 +40,8 @@ type container struct {
 	logs    string
 	files   map[string]string
 	cgroup  string
+	// stopLooks is how many looks at the exit file a signalled runner is still active.
+	stopLooks int
 }
 
 // fakeEngine serves the Engine API's shapes for the calls the provider makes.
@@ -51,6 +55,10 @@ type fakeEngine struct {
 	calls        []string
 	execs        map[string][]string
 	pullError    string
+	// startLogs is a started container's log; stopLooks a signalled runner's looks before
+	// its exit (0: at once).
+	startLogs string
+	stopLooks int
 }
 
 func newFakeEngine() *fakeEngine {
@@ -123,13 +131,25 @@ func (f *fakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 		case action == "start":
 			c.running = true
+			c.logs = f.startLogs
 			w.WriteHeader(http.StatusNoContent)
 		case action == "kill":
-			c.exited = true
+			f.calls = append(f.calls, "signal "+r.URL.Query().Get("signal"))
+			c.stopLooks = f.stopLooks
+			c.exited = c.stopLooks == 0
 			w.WriteHeader(http.StatusNoContent)
 		case action == "json":
 			reply(map[string]any{"State": map[string]any{"Running": c.running}})
 		case action == "archive" && r.Method == http.MethodHead:
+			if r.URL.Query().Get("path") == exitFile && c.stopLooks > 0 {
+				c.stopLooks--
+				c.exited = c.stopLooks == 0
+				if !c.exited {
+					notFound()
+					return
+				}
+				f.calls = append(f.calls, "exited")
+			}
 			if r.URL.Query().Get("path") == exitFile && c.exited {
 				return
 			}
@@ -498,5 +518,42 @@ provider:
 	handoff.Assignment = "ci-1-a-7-42"
 	if err := hosted.Assign(t.Context(), cfg.Hosts[0], "a", handoff); err == nil {
 		t.Fatal("ci-1 took a label of ci-2's table")
+	}
+}
+
+// A job cut short (the slot paused at once) is stopped through its runner: the runner's
+// container is signalled, and removed only after the runner exited, having reported the
+// job's end itself.
+func TestACutJobsRunnerExitsBeforeItsContainerGoes(t *testing.T) {
+	f := newFakeEngine()
+	f.startLogs = `time="x" level=info msg="task 8480 repo is alice/app https://data.forgejo.org https://forgejo.example.org"` + "\n"
+	f.stopLooks = 3
+	d := newTestSystem(t, f)
+	d.settings.StateDir = t.TempDir()
+	now := time.Unix(1_000_000, 0)
+	c := slot.NewCycle(d.settings, d, slot.CycleOptions{Log: slog.New(slog.DiscardHandler),
+		Now: func() time.Time { return now }, Sleep: func(d time.Duration) { now = now.Add(d) }})
+	if !c.Reset() {
+		t.Fatal("the reset failed")
+	}
+	handoff := `{"assignment": "ci-1-a-7-42", "uuid": "` + testUUID + `", "token": "` + testToken +
+		`", "labels": ["docker"], "class": "shared", "unused_minutes": 15}`
+	for name, text := range map[string]string{"a.assignment": handoff, "a.pause": slot.PauseStop} {
+		if err := os.WriteFile(filepath.Join(d.settings.StateDir, name), []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, ok := c.WaitAssignment()
+	if !ok || !c.Serve(a) || c.Last().Task != 8480 {
+		t.Fatalf("served %v, last %+v", ok, c.Last())
+	}
+	if !c.Reset() {
+		t.Fatal("the reset failed")
+	}
+	signal := slices.Index(f.calls, "signal SIGTERM")
+	exited := slices.Index(f.calls, "exited")
+	removed := slices.Index(f.calls[max(signal, 0):], "DELETE /containers/berth-ci-1-a")
+	if signal < 0 || exited < signal || removed < 0 || signal+removed < exited {
+		t.Fatalf("calls %v", f.calls)
 	}
 }
