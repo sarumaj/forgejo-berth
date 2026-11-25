@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The release bot
 writes each version's section from the commits (Conventional Commits) and the hand-written
 Unreleased section.
 
+## 0.4.1 - 2026-11-25
+
+### Fixed
+
+- stop a cut job's runner gracefully before the reset
+
 ## 0.4.0 - 2026-11-25
 
 ### Added
